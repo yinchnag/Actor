@@ -1,0 +1,113 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug deadlock_demo",
+            "type": "go",
+            "request": "launch",
+            "mode": "debug",
+            "program": "${workspaceFolder}/cmd/deadlock_demo",
+            "cwd": "${workspaceFolder}",
+            "showLog": true,
+            "trace": "verbose"
+        },
+        {
+            "name": "Run deadlock_demo (no debug)",
+            "type": "go",
+            "request": "launch",
+            "mode": "exec",
+            "program": "${workspaceFolder}/bin/deadlock_demo.exe",
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "Build deadlock_demo"
+        },
+        {
+            "name": "Test - Actor core tests",
+            "type": "go",
+            "request": "launch",
+            "mode": "test",
+            "program": "${workspaceFolder}",
+            "cwd": "${workspaceFolder}",
+            "args": ["-testify.v"],
+            "showLog": true
+        },
+        {
+            "name": "Test - High concurrency (ACTOR_STRESS=1)",
+            "type": "go",
+            "request": "launch",
+            "mode": "test",
+            "program": "${workspaceFolder}",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "-run",
+                "TestActorLoaderCrossGoroutineHighConcurrencyStability",
+                "-v",
+                "-count=1"
+            ],
+            "env": {
+                "ACTOR_STRESS": "1"
+            },
+            "showLog": true
+        },
+        {
+            "name": "Test - Race detector",
+            "type": "go",
+            "request": "launch",
+            "mode": "test",
+            "program": "${workspaceFolder}",
+            "cwd": "${workspaceFolder}",
+            "args": ["-race", "-v", "-count=1"],
+            "showLog": true
+        },
+        {
+            "name": "Benchmark - Cross-goroutine (cached)",
+            "type": "go",
+            "request": "launch",
+            "mode": "test",
+            "program": "${workspaceFolder}",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "-bench=BenchmarkActorLoaderCrossGoroutineReturnValue",
+                "-benchmem",
+                "-count=3"
+            ],
+            "showLog": true
+        },
+        {
+            "name": "Benchmark - Cross-goroutine (uncached)",
+            "type": "go",
+            "request": "launch",
+            "mode": "test",
+            "program": "${workspaceFolder}",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "-bench=BenchmarkActorLoaderCrossGoroutineUncached",
+                "-benchmem",
+                "-count=3"
+            ],
+            "showLog": true
+        },
+        {
+            "name": "Benchmark - All comparisons",
+            "type": "go",
+            "request": "launch",
+            "mode": "test",
+            "program": "${workspaceFolder}",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "-bench=BenchmarkActorLoader",
+                "-benchmem",
+                "-count=3"
+            ],
+            "showLog": true
+        }
+    ],
+    "compounds": [
+        {
+            "name": "Test Full Suite (with race)",
+            "configurations": [
+                "Test - Actor core tests",
+                "Test - Race detector"
+            ]
+        }
+    ]
+}

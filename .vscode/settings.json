@@ -1,0 +1,36 @@
+{
+    "go.lintOnSave": "package",
+    "go.lintTool": "golangci-lint",
+    "go.lintFlags": ["--fast"],
+    "go.formatOnSave": true,
+    "go.formatTool": "gofmt",
+    "go.useLanguageServer": true,
+    "go.languageServerFlags": ["-rpc.trace"],
+    "go.trace.server": "verbose",
+    "gopls": {
+        "usePlaceholders": true,
+        "staticcheck": true,
+        "gofumpt": true
+    },
+    "[go]": {
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+            "source.organizeImports": "explicit"
+        },
+        "editor.defaultFormatter": "golang.go"
+    },
+    "files.exclude": {
+        "**/.git": true,
+        "**/.vscode": false,
+        "**/bin": false,
+        "**/pkg": false
+    },
+    "files.associations": {
+        "*.gob": "text",
+        "*.pb.go": "go"
+    },
+    "editor.rulers": [100, 120],
+    "editor.indentSize": 4,
+    "editor.insertSpaces": true,
+    "editor.trimAutoWhitespace": true
+}

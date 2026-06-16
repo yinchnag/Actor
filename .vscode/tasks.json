@@ -1,0 +1,156 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build deadlock_demo",
+            "type": "shell",
+            "command": "go",
+            "args": [
+                "build",
+                "-o",
+                "bin/deadlock_demo.exe",
+                "./cmd/deadlock_demo"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "silent",
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Run unit tests",
+            "type": "shell",
+            "command": "go",
+            "args": [
+                "test",
+                "./...",
+                "-v",
+                "-count=1"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Run tests with race detector",
+            "type": "shell",
+            "command": "go",
+            "args": [
+                "test",
+                "-race",
+                "./...",
+                "-count=1"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Run stress test (ACTOR_STRESS=1)",
+            "type": "shell",
+            "command": "go",
+            "args": [
+                "test",
+                "-run=TestActorLoaderCrossGoroutineHighConcurrencyStability",
+                "-v",
+                "-count=1"
+            ],
+            "options": {
+                "env": {
+                    "ACTOR_STRESS": "1"
+                }
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Run benchmarks - all",
+            "type": "shell",
+            "command": "go",
+            "args": [
+                "test",
+                "-bench=BenchmarkActorLoader",
+                "-benchmem",
+                "-count=3",
+                "-run=^$"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Run benchmarks - cached GID",
+            "type": "shell",
+            "command": "go",
+            "args": [
+                "test",
+                "-bench=BenchmarkActorLoaderCrossGoroutineReturnValue",
+                "-benchmem",
+                "-count=3",
+                "-run=^$"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Run benchmarks - uncached GID",
+            "type": "shell",
+            "command": "go",
+            "args": [
+                "test",
+                "-bench=BenchmarkActorLoaderCrossGoroutineUncached",
+                "-benchmem",
+                "-count=3",
+                "-run=^$"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Format code",
+            "type": "shell",
+            "command": "go",
+            "args": [
+                "fmt",
+                "./..."
+            ],
+            "presentation": {
+                "reveal": "silent"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Run vet",
+            "type": "shell",
+            "command": "go",
+            "args": [
+                "vet",
+                "./..."
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        }
+    ]
+}
