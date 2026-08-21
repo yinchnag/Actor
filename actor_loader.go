@@ -6,8 +6,10 @@ package actor
 import (
 	"errors"
 	"fmt"
+	"os"
 	"reflect"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,15 +22,24 @@ const defaultTaskTimeout = 3 * time.Second
 var (
 	errActorClosed      = errors.New("actor is closed")
 	ErrTaskQueueTimeout = errors.New("task enqueue timeout")
+	// ErrActorNotStarted 表示事件循环尚未启动，且调用方不是启动前的唯一持有者。
+	// 用 Start 启动 actor 可以彻底避免这个错误。
+	ErrActorNotStarted = errors.New("actor not started")
 )
 
 type ActorLoader struct {
-	name        string
-	goroutineID uint64
-	closed      atomic.Bool
-	taskChan    chan ITask
-	stopChan    chan struct{}
+	name string
+	// initOwnerGID 记录事件循环启动之前第一个使用该 loader 的 goroutine。
+	// 未启动时只有它能直接执行模块方法，其余调用方一律拒绝，
+	// 否则它们会各自在自己的栈上并发修改模块状态。
+	initOwnerGID uint64
+	goroutineID  uint64
+	closed       atomic.Bool
+	taskChan     chan ITask
+	stopChan     chan struct{}
 
+	// enqueueMu 让投递与排空互斥：enqueueTask 持读锁投递，closeWith 持写锁排空。
+	enqueueMu sync.RWMutex
 	modulesMu sync.RWMutex
 	modules   map[string]IModule
 	closeOnce sync.Once
@@ -71,14 +82,54 @@ func (that *ActorLoader) GetTaskChan() chan<- ITask {
 }
 
 func (that *ActorLoader) Close() {
+	that.closeWith(errActorClosed)
+}
+
+// closeWith 关闭 actor，并用 drainErr 结算所有还排在队列里的任务。
+// drainErr 应当包装 errActorClosed，调用方才能用 errors.Is 统一判定。
+func (that *ActorLoader) closeWith(drainErr error) {
 	that.closeOnce.Do(func() {
-		that.closed.Store(true)
-		close(that.stopChan)
+		that.closed.Store(true) // 此后进入 enqueueTask 的投递方会被挡在 RLock 内
+		close(that.stopChan)    // 唤醒已经卡在 select 里的投递方，避免下面干等
+
+		// 写锁与 enqueueTask 的读锁互斥：拿到它就意味着没有任何投递方还在
+		// 临界区内，也不会再有新的进来。只有在这个前提下排空，队列里剩下的
+		// 才是真正的全部，不会出现“刚排完又飘进来一个”。
+		that.enqueueMu.Lock()
+		defer that.enqueueMu.Unlock()
+		that.drainTask(drainErr)
 	})
 }
 
+// Start 在独立 goroutine 上启动事件循环，直到 goroutineID 发布完成才返回。
+// 这是启动 actor 的推荐方式：Start 返回后，任何来自其它 goroutine 的调用都会
+// 走入队路径，不会再落到 directInvoke 上并发直改模块状态，调用方也不需要
+// sleep 或轮询 GetGoroutineID 去等待启动完成。
+//
+// wg 由 Start 负责 Add，调用方只需 Wait，不要再自行 Add。
+func (that *ActorLoader) Start(wg *sync.WaitGroup) {
+	ready := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		that.SetGoroutineID(that.name)
+		close(ready)
+		that.RunUpdateLoop(wg)
+	}()
+	<-ready
+}
+
+// RunUpdateLoop 运行事件循环，调用方需自行 wg.Add(1)。
+//
+// 优先使用 Start：直接 go RunUpdateLoop 时，从发起 go 到循环内部写入
+// goroutineID 之间存在一个窗口，窗口内的调用会被当成"未启动"处理。
 func (that *ActorLoader) RunUpdateLoop(wg *sync.WaitGroup) {
 	defer wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "actor %s panic in RunUpdateLoop: %v\n%s\n", that.name, r, debug.Stack())
+			that.closeWith(fmt.Errorf("%w: panic in RunUpdateLoop: %v", errActorClosed, r))
+		}
+	}()
 	if that.GetGoroutineID() == 0 {
 		that.SetGoroutineID(that.name)
 	}
@@ -92,24 +143,29 @@ func (that *ActorLoader) RunUpdateLoop(wg *sync.WaitGroup) {
 			// Drain queued tasks so their cleanup goroutines don't hang indefinitely.
 			// Tasks currently executing complete normally; queued-but-unstarted tasks
 			// are completed with errActorClosed so their done channels are closed.
-			for {
-				select {
-				case task := <-that.taskChan:
-					if ct, ok := task.(*ChanTask); ok {
-						waitResult := ct.ShouldWaitResult()
-						ct.complete(nil, errActorClosed)
-						if !waitResult {
-							ct.Release()
-						}
-					}
-				default:
-					return
-				}
-			}
+			that.drainTask(errActorClosed)
+			return
 		case <-ticker.C:
 			that.updateAll(1000)
 		case task := <-that.taskChan:
 			that.handleTask(task)
+		}
+	}
+}
+
+func (that *ActorLoader) drainTask(err error) {
+	for {
+		select {
+		case task := <-that.taskChan:
+			if ct, ok := task.(*ChanTask); ok {
+				waitResult := ct.ShouldWaitResult()
+				ct.complete(nil, err)
+				if !waitResult {
+					ct.Release()
+				}
+			}
+		default:
+			return
 		}
 	}
 }
@@ -149,20 +205,35 @@ func (that *ActorLoader) ModInvokeFrom(callerGID uint64, modName, methodName str
 	}
 
 	gid := atomic.LoadUint64(&that.goroutineID)
-	// goroutineID == 0 means the loop has not started yet; treat as same-goroutine.
-	if gid == 0 || callerGID == gid {
+	if gid == 0 {
+		// 事件循环还没启动，不存在"actor 所属 goroutine"。此时只放行第一个
+		// 使用它的 goroutine（初始化、加载存档等单线程场景），其余一律拒绝：
+		// 否则多个调用方会各自在自己的栈上直接改模块状态，actor 模型就破了。
+		if !that.claimInitOwner(callerGID) {
+			return nil, ErrActorNotStarted
+		}
+		return that.directInvoke(modName, methodName, args...)
+	}
+	if callerGID == gid {
 		return that.directInvoke(modName, methodName, args...)
 	}
 
+	// waitResult 必须在投递之前存进局部变量。投递成功之后，无返回值的任务
+	// 归事件循环所有：它 complete 完就 Release，任务当场回池、被别的调用方
+	// 重新拿去用。此时再回头读 task 的任何字段都是读别人的任务——
+	// 轻则拿到脏值，重则误判成"要等结果"，去 Await 并 Release 一个不属于自己的任务。
+	// handleTask/drainTask 里同样是先取快照再 complete，这里遵循同一条纪律。
+	waitResult := that.shouldWaitResult(modName, methodName)
+
 	task := NewChanTask(callerGID, gid, modName, methodName, args...)
-	task.SetWaitResult(that.shouldWaitResult(modName, methodName))
+	task.SetWaitResult(waitResult)
 
 	if err := that.enqueueTask(task); err != nil {
 		task.Release()
 		return nil, err
 	}
 
-	if task.ShouldWaitResult() {
+	if waitResult {
 		err := task.WithTimeout(defaultTaskTimeout).Await()
 		if err != nil {
 			done := task.done
@@ -178,6 +249,18 @@ func (that *ActorLoader) ModInvokeFrom(callerGID uint64, modName, methodName str
 		return results, callErr
 	}
 	return nil, nil
+}
+
+// claimInitOwner 认定事件循环启动前的唯一持有者：第一个调用方抢到所有权，
+// 此后只有它返回 true。取不到 gid（callerGID 为 0）时一律拒绝。
+func (that *ActorLoader) claimInitOwner(callerGID uint64) bool {
+	if callerGID == 0 {
+		return false
+	}
+	if atomic.CompareAndSwapUint64(&that.initOwnerGID, 0, callerGID) {
+		return true
+	}
+	return atomic.LoadUint64(&that.initOwnerGID) == callerGID
 }
 
 func (that *ActorLoader) OnMessageHandler(p IProtocol) {
@@ -214,6 +297,18 @@ func (that *ActorLoader) directInvoke(modName, methodName string, args ...any) (
 }
 
 func (that *ActorLoader) handleTask(task ITask) {
+	defer func() {
+		if r := recover(); r != nil {
+			if ct, ok := task.(*ChanTask); ok {
+				waitResult := ct.ShouldWaitResult()
+				ct.complete(nil, fmt.Errorf("panic: %v", r))
+				if !waitResult {
+					ct.Release()
+				}
+			}
+			that.Close()
+		}
+	}()
 	if task == nil {
 		return
 	}
@@ -254,6 +349,14 @@ func (that *ActorLoader) shouldWaitResult(modName, methodName string) bool {
 }
 
 func (that *ActorLoader) enqueueTask(task *ChanTask) error {
+	// 持读锁投递：Close 必须等这里退出后才排空，
+	// 否则 select 随机选中发送时，任务会落进已经没人消费的 channel。
+	that.enqueueMu.RLock()
+	defer that.enqueueMu.RUnlock()
+	if that.IsClose() {
+		return errActorClosed
+	}
+
 	enqueueTimer := time.NewTimer(defaultTaskTimeout)
 	defer enqueueTimer.Stop()
 

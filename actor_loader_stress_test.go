@@ -40,8 +40,7 @@ func TestActorLoaderCrossGoroutineHighConcurrencyStability(t *testing.T) {
 	loader.AddModule(NewSlowCalcMod())
 
 	var loopWG sync.WaitGroup
-	loopWG.Add(1)
-	go loader.RunUpdateLoop(&loopWG)
+	loader.Start(&loopWG)
 	defer func() {
 		loader.Close()
 		loopWG.Wait()
@@ -121,19 +120,11 @@ func TestActorLoaderTaskTimeoutPath(t *testing.T) {
 	loader.AddModule(NewSlowCalcMod())
 
 	var loopWG sync.WaitGroup
-	loopWG.Add(1)
-	go loader.RunUpdateLoop(&loopWG)
+	loader.Start(&loopWG) // 返回时 goroutineID 已发布，不需要轮询等待
 	defer func() {
 		loader.Close()
 		loopWG.Wait()
 	}()
-
-	for i := 0; i < 50 && loader.GetGoroutineID() == 0; i++ {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if loader.GetGoroutineID() == 0 {
-		t.Fatalf("loader goroutine ID not ready")
-	}
 
 	start := time.Now()
 	_, err := loader.ModInvoke("SlowCalcMod", "SlowSum", 1, 2)
@@ -165,8 +156,7 @@ func BenchmarkActorLoaderCrossGoroutineReturnValue(b *testing.B) {
 	loader.AddModule(NewSlowCalcMod())
 
 	var loopWG sync.WaitGroup
-	loopWG.Add(1)
-	go loader.RunUpdateLoop(&loopWG)
+	loader.Start(&loopWG)
 	defer func() {
 		loader.Close()
 		loopWG.Wait()
@@ -195,8 +185,7 @@ func BenchmarkActorLoaderCrossGoroutineUncached(b *testing.B) {
 	loader.AddModule(NewSlowCalcMod())
 
 	var loopWG sync.WaitGroup
-	loopWG.Add(1)
-	go loader.RunUpdateLoop(&loopWG)
+	loader.Start(&loopWG)
 	defer func() {
 		loader.Close()
 		loopWG.Wait()

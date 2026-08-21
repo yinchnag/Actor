@@ -1,7 +1,14 @@
 package goroutineleak_test
 
 import (
+	"errors"
+	"fmt"
+	"os"
+	"runtime"
+	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,166 +17,902 @@ import (
 	"go.uber.org/goleak"
 )
 
-// TestMain 在所有测试结束后用 goleak 全局扫描泄漏的 goroutine。
-// 任何测试留下未关闭的 goroutine 都会在这里被捕获。
+// 本文件压的是 actor 框架"边界之外"的行为：队列被打满、模块方法 panic、
+// 关闭时队列里还有活、跨 actor 环形同步调用、actor 大批量创建销毁。
+// 这些路径只要漏掉一次结算，泄漏的就不止一个 goroutine——
+// ModInvokeFrom 超时后会派一个清理协程挂在 <-doneCh 上，
+// 任务永远不 complete，它就永远不退出，ChanTask 也回不了池。
+//
+// 两层防护：每个用例自己 defer noLeak(t)()，泄漏能定位到具体用例；
+// TestMain 再全局兜一次，防止用例的检查窗口没覆盖到。
+//
+// 时间处理原则：能用 channel 同步就不用 sleep。唯一躲不开的等待是框架写死的
+// defaultTaskTimeout(3s)——它不可配置，凡是要触发超时的用例都至少花 3s，
+// 已用 -short 标出。
+
 func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }
 
-// --- 辅助 ---
+// ModObj 用宿主结构体的类型名当模块名。
+const (
+	gateName  = "gateMod"
+	relayName = "relayMod"
+	selfName  = "selfMod"
+)
 
-type slowMod struct {
-	actor.ModObj[*slowMod]
+// defaultTaskTimeout 在框架内部是私有常量，这里留一点裕量复刻它，
+// 用于等待"未 Stop 的定时器"自然到期。
+const timeoutSlack = 4 * time.Second
+
+// --- 通用辅助 ---
+
+// noLeak 返回一个收尾函数：只盯本用例新增的 goroutine。
+// 用法 `defer noLeak(t)()` —— 它要第一个注册，才能最后一个执行（defer 是 LIFO），
+// 否则会在 actor 还没停下来的时候就去数 goroutine。
+func noLeak(t *testing.T) func() {
+	t.Helper()
+	ignore := goleak.IgnoreCurrent()
+	return func() { goleak.VerifyNone(t, ignore) }
 }
 
-func newSlowMod() *slowMod {
-	m := &slowMod{}
+// waitAll 等一组调用方全部返回。用它而不是直接 wg.Wait()，
+// 是因为"卡住不返回"正是这些用例要抓的 bug——直接 Wait 会把测试挂死，
+// 报不出任何信息。
+func waitAll(t *testing.T, wg *sync.WaitGroup, timeout time.Duration, what string) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		t.Fatalf("等待超时(%v): %s", timeout, what)
+	}
+}
+
+func requireStress(t *testing.T) {
+	t.Helper()
+	if os.Getenv("ACTOR_STRESS") != "1" {
+		t.Skip("重压用例，设置 ACTOR_STRESS=1 运行")
+	}
+}
+
+func pct(sorted []time.Duration, p float64) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
+	return sorted[int(float64(len(sorted)-1)*p)]
+}
+
+// --- 压测模块 ---
+
+// gateMod 的耗时行为全部由 channel 控制，不用 sleep：
+// "actor 何时被堵死""何时放行"由测试精确决定，断言就不会随机器负载抖动，
+// goleak 那约 0.5s 的重试窗口也才够用。
+type gateMod struct {
+	actor.ModObj[*gateMod]
+
+	gate        chan struct{} // 关闭后 Block 立即返回
+	releaseOnce sync.Once
+	entered     chan int // Block 已进入的信号，带缓冲、非阻塞投递
+
+	echoed  atomic.Int64
+	fired   atomic.Int64
+	updates atomic.Int64
+}
+
+func newGateMod() *gateMod {
+	m := &gateMod{
+		gate:    make(chan struct{}),
+		entered: make(chan int, 1024),
+	}
+	m.Init() // Init 靠字段偏移反推宿主指针，此后这个结构体不能再被拷贝
+	return m
+}
+
+// Echo 是最廉价的有返回值方法，用来量吞吐、验结果有没有串味。
+func (m *gateMod) Echo(x int) int {
+	m.echoed.Add(1)
+	return x
+}
+
+// Fire 没有返回值 → shouldWaitResult 为 false → 走"投递完就返回"的路径，
+// 不会创建 3s 定时器，适合用来长时间饱和 actor。
+func (m *gateMod) Fire(x int) {
+	m.fired.Add(int64(x))
+}
+
+// Block 把事件循环钉死在这里，直到测试关闭 gate。
+// 事件循环是单消费者，钉住它就等于钉住整个 actor——正是要压的那条边界。
+func (m *gateMod) Block(x int) int {
+	select {
+	case m.entered <- x:
+	default:
+	}
+	<-m.gate
+	return x
+}
+
+// Boom 模拟模块方法炸掉：handleTask 会 recover，把 panic 当错误回传，
+// 顺手 Close 掉整个 actor。
+func (m *gateMod) Boom(x int) int {
+	panic(fmt.Sprintf("boom:%d", x))
+}
+
+// Update 覆盖 ModObj.Update（它在 baseMethodSet 里，不会被反射注册），
+// 用来验证重压之下 1s 的 ticker 没被任务饿死。
+func (m *gateMod) Update(dt int64) {
+	_ = dt
+	m.updates.Add(1)
+}
+
+func (m *gateMod) release() {
+	m.releaseOnce.Do(func() { close(m.gate) })
+}
+
+// harness 把 loader、模块和事件循环的 WaitGroup 绑在一起。
+// 需要精确控制关闭时序的用例可以单独调 mod.release()/loader.Close()/wg.Wait()，
+// stop() 是幂等的兜底。
+type harness struct {
+	loader *actor.ActorLoader
+	mod    *gateMod
+	wg     sync.WaitGroup
+	once   sync.Once
+}
+
+func newHarness(name string) *harness {
+	h := &harness{loader: actor.NewActorLoader(name), mod: newGateMod()}
+	h.loader.Init()
+	h.loader.AddModule(h.mod)
+	// Start 返回时 goroutineID 已发布：此后外部调用必然走入队路径，
+	// 不会退化成 directInvoke 并发直改模块状态，也就不必 sleep 等启动。
+	h.loader.Start(&h.wg)
+	return h
+}
+
+func (h *harness) stop() {
+	h.once.Do(func() {
+		h.mod.release() // 先放行卡在 Block 里的方法，否则事件循环退不出来
+		h.loader.Close()
+		h.wg.Wait()
+	})
+}
+
+// blockActor 让事件循环停在 Block 上；返回时可以确信 actor 已被堵死。
+func (h *harness) blockActor(t *testing.T) {
+	t.Helper()
+	go h.loader.ModInvoke(gateName, "Block", 1) //nolint:errcheck
+	select {
+	case <-h.mod.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("事件循环没能进入 Block")
+	}
+}
+
+// --- 基线 ---
+
+// TestNoLeakNormalUsage 正常调用路径不泄漏，且结果逐一对得上号。
+func TestNoLeakNormalUsage(t *testing.T) {
+	defer noLeak(t)()
+	h := newHarness("normal")
+	defer h.stop()
+
+	const calls = 2000
+	gid := actor.CurrentGID()
+	for i := 0; i < calls; i++ {
+		out, err := h.loader.ModInvokeFrom(gid, gateName, "Echo", i)
+		if err != nil {
+			t.Fatalf("第 %d 次调用失败: %v", i, err)
+		}
+		if len(out) != 1 || int(out[0].Int()) != i {
+			t.Fatalf("第 %d 次调用结果串味: %v", i, out)
+		}
+	}
+	if got := h.mod.echoed.Load(); got != calls {
+		t.Fatalf("实际执行 %d 次，期望 %d 次", got, calls)
+	}
+}
+
+// TestNoLeakFireAndForgetFlood 压无返回值路径：投递完即返回，
+// 任务由事件循环 complete 后自行 Release。丢一个就对不上账。
+func TestNoLeakFireAndForgetFlood(t *testing.T) {
+	defer noLeak(t)()
+	h := newHarness("fire-flood")
+	defer h.stop()
+
+	workers := runtime.NumCPU()
+	if workers < 4 {
+		workers = 4
+	}
+	const perWorker = 2000
+
+	var enqueued, rejected int64
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			gid := actor.CurrentGID()
+			for i := 0; i < perWorker; i++ {
+				if _, err := h.loader.ModInvokeFrom(gid, gateName, "Fire", 1); err != nil {
+					atomic.AddInt64(&rejected, 1)
+					continue
+				}
+				atomic.AddInt64(&enqueued, 1)
+			}
+		}()
+	}
+	waitAll(t, &wg, 60*time.Second, "fire-and-forget 洪水")
+
+	// taskChan 是单消费者 FIFO：这次同步调用返回时，
+	// 排在它前面的 Fire 必然都已执行完，不需要 sleep 去猜。
+	if _, err := h.loader.ModInvoke(gateName, "Echo", 1); err != nil {
+		t.Fatalf("屏障调用失败: %v", err)
+	}
+
+	if rejected != 0 {
+		t.Errorf("%d 次投递被拒：64 槽的队列在 3s 内都没排空，吞吐异常", rejected)
+	}
+	if got := h.mod.fired.Load(); got != enqueued {
+		t.Fatalf("投递成功 %d 次，实际执行 %d 次——有任务被丢了", enqueued, got)
+	}
+	t.Logf("fire-and-forget: %d 次投递全部落地", enqueued)
+}
+
+// TestNoLeakOnCloseDrainsQueuedTasks 覆盖"事件循环还堵着、队列里全是活"时关闭。
+//
+// 关键在 closeWith 的顺序：先置 closed、关 stopChan 放走卡在满队列上的投递方，
+// 再拿 enqueueMu 写锁排空。少任何一步，队列里的任务就没人 complete：
+// 调用方要干等满 3s，超时后派出的清理协程更会永久挂在 <-doneCh 上。
+func TestNoLeakOnCloseDrainsQueuedTasks(t *testing.T) {
+	defer noLeak(t)()
+	h := newHarness("close-drain")
+	defer h.stop()
+
+	h.blockActor(t)
+
+	const callers = 100 // 远超 taskChan 的 64 槽，剩下的会卡在投递上
+	var slow, returned int64
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func(i int) {
+			defer wg.Done()
+			gid := actor.CurrentGID()
+			start := time.Now()
+			_, _ = h.loader.ModInvokeFrom(gid, gateName, "Echo", i)
+			if time.Since(start) >= 2*time.Second {
+				atomic.AddInt64(&slow, 1)
+			}
+			atomic.AddInt64(&returned, 1)
+		}(i)
+	}
+	// 没有可观测的"已入队"信号，只能给一小段时间让队列填满、
+	// 其余投递方卡到 select 上。断言本身不依赖这个时长的精度。
+	time.Sleep(100 * time.Millisecond)
+
+	h.loader.Close() // 事件循环此刻仍卡在 Block 里，排空只能由 Close 这一侧完成
+	waitAll(t, &wg, 5*time.Second, "关闭后所有调用方返回")
+
+	if slow != 0 {
+		t.Fatalf("%d 个调用方等满超时才返回：关闭时有任务没被结算", slow)
+	}
+	if returned != callers {
+		t.Fatalf("只有 %d/%d 个调用方返回", returned, callers)
+	}
+
+	h.mod.release() // 放行 Block，事件循环才能退出
+	h.wg.Wait()
+}
+
+// TestPanicWithSaturatedQueueUnblocksEveryone 压最难的那个交织：
+// 模块方法 panic 时，队列是满的、还有一批投递方卡在 select 上。
+//
+// handleTask 的 recover 会在 actor 自己的协程里调 Close，
+// 而 closeWith 要拿 enqueueMu 写锁——此时投递方正持着读锁卡在满队列上，
+// 唯一的解法是 close(stopChan) 先于取锁执行。顺序反了就是死锁，谁也退不出去。
+func TestPanicWithSaturatedQueueUnblocksEveryone(t *testing.T) {
+	defer noLeak(t)()
+	h := newHarness("panic-saturated")
+	defer h.stop()
+
+	h.blockActor(t)
+
+	// Boom 抢在其它任务前面入队，放行后第一个被取出
+	boomErr := make(chan error, 1)
+	go func() {
+		_, err := h.loader.ModInvoke(gateName, "Boom", 7)
+		boomErr <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	const callers = 120 // 64 个占满队列，其余卡在投递上
+	var slow int64
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func(i int) {
+			defer wg.Done()
+			gid := actor.CurrentGID()
+			start := time.Now()
+			_, _ = h.loader.ModInvokeFrom(gid, gateName, "Echo", i)
+			if time.Since(start) >= 2*time.Second {
+				atomic.AddInt64(&slow, 1)
+			}
+		}(i)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	// 放行：循环从 Block 里出来 → 取到 Boom → panic → recover → 关掉整个 actor
+	h.mod.release()
+
+	waitAll(t, &wg, 5*time.Second, "panic 后所有调用方返回")
+
+	select {
+	case err := <-boomErr:
+		if err == nil || !strings.Contains(err.Error(), "panic") {
+			t.Fatalf("panic 应当作为错误回传给调用方，got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Boom 的调用方没有返回")
+	}
+	if slow != 0 {
+		t.Fatalf("%d 个调用方等满超时：panic 关闭 actor 时漏了结算", slow)
+	}
+	if !h.loader.IsClose() {
+		t.Fatal("模块方法 panic 之后 actor 应当已关闭")
+	}
+	h.wg.Wait() // 事件循环应当已自行退出
+}
+
+// TestNoLeakActorChurn 压 actor 的生命周期：反复建了停、停了建。
+// 对应"每个玩家一个 actor、频繁上下线"的场景——只要 Close 漏掉一次，
+// 峰值就会随轮次线性涨上去。
+func TestNoLeakActorChurn(t *testing.T) {
+	defer noLeak(t)()
+
+	rounds := 300
+	if testing.Short() {
+		rounds = 50
+	}
+	base := runtime.NumGoroutine()
+	peak := base
+
+	for r := 0; r < rounds; r++ {
+		h := newHarness(fmt.Sprintf("churn-%d", r))
+		for i := 0; i < 5; i++ {
+			out, err := h.loader.ModInvoke(gateName, "Echo", i)
+			if err != nil || len(out) != 1 || int(out[0].Int()) != i {
+				h.stop()
+				t.Fatalf("第 %d 轮调用异常: %v", r, err)
+			}
+		}
+		h.stop()
+		if n := runtime.NumGoroutine(); n > peak {
+			peak = n
+		}
+	}
+
+	t.Logf("%d 轮建/停 actor：goroutine 基线 %d，峰值 %d，收尾 %d",
+		rounds, base, peak, runtime.NumGoroutine())
+	if peak > base+16 {
+		t.Fatalf("goroutine 峰值 %d 远高于基线 %d：有 actor 没停干净", peak, base)
+	}
+}
+
+// TestUpdateTickerNotStarvedUnderLoad 验证饱和时 1s 的 ticker 没被任务饿死。
+//
+// 事件循环用一个 select 同时等 stopChan/ticker.C/taskChan：taskChan 若持续就绪，
+// Go 在两者都就绪时是随机选的——Update 会被推迟，但不该被饿死。
+// 负载用 Fire（无返回值），既能打满队列又不会留下一堆 3s 定时器。
+func TestUpdateTickerNotStarvedUnderLoad(t *testing.T) {
+	if testing.Short() {
+		t.Skip("需要持续加压 2.5s，-short 下跳过")
+	}
+	defer noLeak(t)()
+	h := newHarness("ticker-starve")
+	defer h.stop()
+
+	stopLoad := make(chan struct{})
+	var wg sync.WaitGroup
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			gid := actor.CurrentGID()
+			for {
+				select {
+				case <-stopLoad:
+					return
+				default:
+				}
+				_, _ = h.loader.ModInvokeFrom(gid, gateName, "Fire", 1)
+			}
+		}()
+	}
+	time.Sleep(2500 * time.Millisecond)
+	close(stopLoad)
+	waitAll(t, &wg, 10*time.Second, "停止加压")
+
+	if _, err := h.loader.ModInvoke(gateName, "Echo", 1); err != nil {
+		t.Fatalf("加压后 actor 不健康: %v", err)
+	}
+	updates := h.mod.updates.Load()
+	t.Logf("2.5s 满负荷期间执行了 %d 次 Fire，Update 触发 %d 次", h.mod.fired.Load(), updates)
+	if updates < 1 {
+		t.Fatal("满负荷时 Update 一次都没触发：ticker 被任务饿死了")
+	}
+}
+
+// --- 需要等满框架 3s 超时的用例 ---
+
+// TestTimeoutStormNoLeakAndPoolIntegrity 同时压两条超时路径，再验池子有没有被串用。
+//
+// actor 全程被 Block 钉死：抢到 64 个槽的调用方等 Await 超时，
+// 没抢到的等投递超时。前者每人留下一个清理协程挂在 <-doneCh 上——
+// 放行后事件循环必须把它们逐个 complete，否则泄漏数正好等于 awaitTimeout。
+//
+// 放行之后立刻并发打新调用：那一刻正是超时任务批量回池的时刻，
+// 若有晚到的 complete 写进了被复用的 ChanTask，结果就会串味。
+func TestTimeoutStormNoLeakAndPoolIntegrity(t *testing.T) {
+	if testing.Short() {
+		t.Skip("需要等满框架默认的 3s 超时，-short 下跳过")
+	}
+	defer noLeak(t)()
+	h := newHarness("timeout-storm")
+	defer h.stop()
+
+	h.blockActor(t)
+
+	const callers = 200
+	var awaitTimeout, queueTimeout, other, unexpectedOK int64
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func(i int) {
+			defer wg.Done()
+			gid := actor.CurrentGID()
+			_, err := h.loader.ModInvokeFrom(gid, gateName, "Echo", i)
+			switch {
+			case err == nil:
+				atomic.AddInt64(&unexpectedOK, 1)
+			case errors.Is(err, actor.ErrTaskAwaitTimeout):
+				atomic.AddInt64(&awaitTimeout, 1)
+			case errors.Is(err, actor.ErrTaskQueueTimeout):
+				atomic.AddInt64(&queueTimeout, 1)
+			default:
+				atomic.AddInt64(&other, 1)
+			}
+		}(i)
+	}
+	waitAll(t, &wg, 10*time.Second, "超时风暴中所有调用方返回")
+
+	t.Logf("超时分布: await=%d queue=%d 其它=%d 意外成功=%d",
+		awaitTimeout, queueTimeout, other, unexpectedOK)
+	if unexpectedOK != 0 || other != 0 {
+		t.Fatalf("actor 全程被堵死，不该有成功或其它类型的错误")
+	}
+	if awaitTimeout == 0 || queueTimeout == 0 {
+		t.Fatalf("没能同时压到两条超时路径（64 槽 vs %d 个调用方）", callers)
+	}
+
+	h.mod.release()
+
+	const checkers, perChecker = 8, 400
+	var mismatch int64
+	var wg2 sync.WaitGroup
+	wg2.Add(checkers)
+	for c := 0; c < checkers; c++ {
+		go func(c int) {
+			defer wg2.Done()
+			gid := actor.CurrentGID()
+			for i := 0; i < perChecker; i++ {
+				want := c*perChecker + i
+				out, err := h.loader.ModInvokeFrom(gid, gateName, "Echo", want)
+				if err != nil || len(out) != 1 || int(out[0].Int()) != want {
+					atomic.AddInt64(&mismatch, 1)
+					return
+				}
+			}
+		}(c)
+	}
+	waitAll(t, &wg2, 60*time.Second, "超时风暴后的健康检查")
+	if mismatch != 0 {
+		t.Fatalf("风暴过后有 %d 个调用拿错了结果：ChanTask 池被串用了", mismatch)
+	}
+}
+
+// --- 跨 actor / 重入 ---
+
+// relayMod 在自己的 actor 协程里同步调用对端 actor。
+type relayMod struct {
+	actor.ModObj[*relayMod]
+	peer  *actor.ActorLoader // 只在 Start 之前赋值，之后只在本 actor 协程上读
+	calls atomic.Int64
+}
+
+func newRelayMod() *relayMod {
+	m := &relayMod{}
 	m.Init()
 	return m
 }
 
-// Fast 立即返回，用于验证 loader 超时后仍健康。
-func (m *slowMod) Fast(a, b int) int { return a + b }
-
-// Slow 故意阻塞 3.5s，触发默认 3s 超时（保留 0.5s 裕量避免机器负载影响）。
-func (m *slowMod) Slow(a, b int) int {
-	time.Sleep(3500 * time.Millisecond)
-	return a + b
+// Ping 把调用接力给对端。对端若再回调回来，本 actor 正卡在 Await 上、
+// 消费不了任务，就是死锁——只能等 defaultTaskTimeout 兜底。
+func (m *relayMod) Ping(n int) (int, error) {
+	m.calls.Add(1)
+	if n <= 0 || m.peer == nil {
+		return n, nil
+	}
+	out, err := m.peer.ModInvoke(relayName, "Ping", n-1)
+	if err != nil {
+		return -1, err
+	}
+	if len(out) != 2 {
+		return -1, fmt.Errorf("对端返回值个数异常: %d", len(out))
+	}
+	if e, _ := out[1].Interface().(error); e != nil {
+		return -1, e
+	}
+	return int(out[0].Int()) + 1, nil
 }
 
-func startLoader(t *testing.T, name string) (*actor.ActorLoader, func()) {
-	t.Helper()
-	loader := actor.NewActorLoader(name)
-	loader.Init()
-	loader.AddModule(newSlowMod())
+func startRelay(name string, wg *sync.WaitGroup, peer *actor.ActorLoader) *actor.ActorLoader {
+	l := actor.NewActorLoader(name)
+	l.Init()
+	m := newRelayMod()
+	m.peer = peer // Start 之前写，之后只读，没有竞态
+	l.AddModule(m)
+	l.Start(wg)
+	return l
+}
+
+// TestCrossActorChainNoDeadlock 对照组：非环形的链式同步调用一切正常。
+func TestCrossActorChainNoDeadlock(t *testing.T) {
+	defer noLeak(t)()
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go loader.RunUpdateLoop(&wg)
+	c := startRelay("relay-c", &wg, nil)
+	b := startRelay("relay-b", &wg, c)
+	a := startRelay("relay-a", &wg, b)
+	defer func() {
+		a.Close()
+		b.Close()
+		c.Close()
+		wg.Wait()
+	}()
 
-	// 等 goroutineID 就绪
-	for i := 0; i < 50 && loader.GetGoroutineID() == 0; i++ {
-		time.Sleep(10 * time.Millisecond)
+	start := time.Now()
+	out, err := a.ModInvoke(relayName, "Ping", 2)
+	if err != nil {
+		t.Fatalf("链式调用失败: %v", err)
 	}
+	if e, _ := out[1].Interface().(error); e != nil {
+		t.Fatalf("链式调用内层报错: %v", e)
+	}
+	if got := int(out[0].Int()); got != 2 {
+		t.Fatalf("a→b→c 应当接力两跳，got %d", got)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("链式调用不该慢到 %v", d)
+	}
+}
 
-	stop := func() {
+// TestCrossActorCycleDeadlocksUntilTimeout 固化框架的一条硬边界：
+// 两个 actor 互相同步调用会死锁，只能靠 3s 超时解开。
+//
+// a 的协程执行 Ping 时卡在等 b 的结果上，此刻 a 的事件循环停摆、
+// 消费不了任何任务；b 回调 a 的那个任务就一直躺在 a 的队列里。
+// 这不是 bug，是"同步跨 actor 调用"的固有代价——但它必须以超时收场，
+// 而不是永久挂死，且超时之后两个 actor 都要能继续干活。
+//
+// 还有一个容易踩空的细节：环上每一层的 3s 计时几乎同时起跑，谁先到期取决于
+// 定时器精度（Windows 上尤其粗），所以收场有两种，且是随机的——
+// 要么最外层自己超时，要么内层的超时先解开、把错误一路传回来。
+// 无论哪种，上游看到的都只是"3 秒没回话"，无从区分对端是慢还是环形死锁。
+// 用例把两种都算通过，只钉死"必须以 ErrTaskAwaitTimeout 收场、且不永久挂死"。
+func TestCrossActorCycleDeadlocksUntilTimeout(t *testing.T) {
+	if testing.Short() {
+		t.Skip("需要等满框架默认的 3s 超时，-short 下跳过")
+	}
+	defer noLeak(t)()
+
+	var wg sync.WaitGroup
+	a := actor.NewActorLoader("cycle-a")
+	b := actor.NewActorLoader("cycle-b")
+	a.Init()
+	b.Init()
+	ma, mb := newRelayMod(), newRelayMod()
+	ma.peer, mb.peer = b, a // 成环
+	a.AddModule(ma)
+	b.AddModule(mb)
+	a.Start(&wg)
+	b.Start(&wg)
+	defer func() {
+		a.Close()
+		b.Close()
+		wg.Wait()
+	}()
+
+	start := time.Now()
+	out, err := a.ModInvoke(relayName, "Ping", 2)
+	elapsed := time.Since(start)
+
+	settled, where := err, "外层调用方自己超时"
+	if err == nil {
+		if len(out) != 2 {
+			t.Fatalf("返回值个数异常: %d", len(out))
+		}
+		settled, _ = out[1].Interface().(error)
+		where = "内层先超时并把错误传了回来"
+	}
+	if !errors.Is(settled, actor.ErrTaskAwaitTimeout) {
+		t.Fatalf("环形同步调用应当以 Await 超时收场，got %v", settled)
+	}
+	if elapsed < 2500*time.Millisecond {
+		t.Fatalf("没走到超时路径？elapsed=%v", elapsed)
+	}
+	t.Logf("跨 actor 环形同步调用死锁，%v 后由超时解开（本次是%s；3s 上限写死在框架里，不可配）",
+		elapsed, where)
+
+	// 兜底之后两个 actor 都要恢复正常。
+	// 注意 a 的队列里还压着 b 那个被搁置的回调，它排在下面这次调用前面（FIFO），
+	// 所以下面调用一旦返回，就能确定那个"迟到 3 秒"的任务也已经被执行掉了。
+	for name, l := range map[string]*actor.ActorLoader{"a": a, "b": b} {
+		out, err := l.ModInvoke(relayName, "Ping", 0)
+		if err != nil {
+			t.Fatalf("actor %s 死锁解开后不可用: %v", name, err)
+		}
+		if int(out[0].Int()) != 0 {
+			t.Fatalf("actor %s 死锁解开后状态异常", name)
+		}
+	}
+	// Ping(2) + b 迟到的回调 Ping(0) + 上面的健康检查 Ping(0) = 3 次
+	if got := ma.calls.Load(); got < 3 {
+		t.Fatalf("a 只执行了 %d 次 Ping：被搁置的回调没能补上", got)
+	}
+}
+
+// selfMod 在模块方法里回调自己所属的 loader。
+type selfMod struct {
+	actor.ModObj[*selfMod]
+	self *actor.ActorLoader
+}
+
+func newSelfMod() *selfMod {
+	m := &selfMod{}
+	m.Init()
+	return m
+}
+
+// Recurse 递归调用自己。调用方 GID 与 actor 自身的 GID 相同，
+// ModInvokeFrom 会走 directInvoke，直接在当前栈上执行，不入队。
+func (m *selfMod) Recurse(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	out, err := m.self.ModInvoke(selfName, "Recurse", n-1)
+	if err != nil || len(out) != 1 {
+		return -1 << 30 // 让上层的累加结果明显跑飞
+	}
+	return int(out[0].Int()) + 1
+}
+
+// RecurseFast 与 Recurse 等价，只是不再让 ModInvoke 去 currentGID 解析栈：
+// 模块方法本来就跑在 actor 自己的协程上，GetGoroutineID() 就是当前 GID，
+// 一次原子读即可。用它跟 Recurse 对比，能量出 currentGID 在重入路径上的占比。
+func (m *selfMod) RecurseFast(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	out, err := m.self.ModInvokeFrom(m.self.GetGoroutineID(), selfName, "RecurseFast", n-1)
+	if err != nil || len(out) != 1 {
+		return -1 << 30
+	}
+	return int(out[0].Int()) + 1
+}
+
+// TestReentrantSelfInvokeDoesNotDeadlock 验证同 actor 内的重入调用不会自死锁：
+// 同协程走 directInvoke，不经过队列，所以深递归也安全。
+//
+// 但它有个很贵的隐性成本：ModInvoke 每次都要 currentGID()，而 currentGID 靠
+// runtime.Stack 解析——栈越深它越慢，重入路径恰恰是把栈越堆越高。
+// 用例量两个深度看成本怎么涨，再跟 ModInvokeFrom(GetGoroutineID(), ...) 对照，
+// 把 currentGID 在其中的占比算出来。
+//
+// 另有一条隐含上限：整段递归跑在一次 ModInvoke 的 3s 预算里，
+// 递归太深会直接把外层调用方拖到超时。
+func TestReentrantSelfInvokeDoesNotDeadlock(t *testing.T) {
+	defer noLeak(t)()
+
+	loader := actor.NewActorLoader("reentrant")
+	loader.Init()
+	m := newSelfMod()
+	m.self = loader
+	loader.AddModule(m)
+
+	var wg sync.WaitGroup
+	loader.Start(&wg)
+	defer func() {
 		loader.Close()
 		wg.Wait()
-	}
-	return loader, stop
-}
+	}()
 
-// --- 测试 ---
-
-// TestNoLeakNormalUsage 验证正常调用路径不泄漏 goroutine。
-func TestNoLeakNormalUsage(t *testing.T) {
-	loader, stop := startLoader(t, "normal")
-	defer stop()
-
-	for i := 0; i < 20; i++ {
-		out, err := loader.ModInvoke("slowMod", "Fast", i, i)
-		if err != nil {
-			t.Fatalf("invoke failed: %v", err)
+	// repeat 是为了让总耗时远高于时钟粒度：Windows 上 time.Now 偶尔只有
+	// 十几毫秒的分辨率，单次几百微秒的测量会直接量成 0。
+	measure := func(method string, depth, repeat int) time.Duration {
+		t.Helper()
+		start := time.Now()
+		for r := 0; r < repeat; r++ {
+			out, err := loader.ModInvoke(selfName, method, depth)
+			if err != nil {
+				t.Fatalf("%s 递归 %d 层失败: %v", method, depth, err)
+			}
+			if got := int(out[0].Int()); got != depth {
+				t.Fatalf("%s 重入深度对不上: got %d, want %d", method, got, depth)
+			}
 		}
-		if len(out) != 1 || int(out[0].Int()) != i+i {
-			t.Fatalf("unexpected result at i=%d", i)
-		}
+		elapsed := time.Since(start)
+		per := elapsed / time.Duration(depth*repeat)
+		t.Logf("%-12s 递归 %3d 层 ×%d 共 %-14v 每层约 %v", method, depth, repeat, elapsed, per)
+		return per
+	}
+
+	shallow := measure("Recurse", 100, 5)
+	deep := measure("Recurse", 500, 1)
+	fast := measure("RecurseFast", 500, 100)
+
+	t.Logf("深度 100→500，每层成本 %v→%v（×%.1f）：currentGID 的 runtime.Stack 要走栈，重入越深越贵",
+		shallow, deep, float64(deep)/float64(shallow))
+	t.Logf("同样 500 层，改用 ModInvokeFrom(GetGoroutineID()) 后每层 %v，快约 %.0f 倍——"+
+		"模块方法本就跑在 actor 协程上，没必要每层再解析一次栈",
+		fast, float64(deep)/float64(fast))
+
+	if fast <= 0 || fast >= deep {
+		t.Fatalf("缓存 GID 的重入路径不该比 currentGID 版本更慢: %v vs %v", fast, deep)
 	}
 }
 
-// TestNoLeakOnTimeout 验证超时路径的清理 goroutine 在任务最终完成后能正常退出。
-//
-// 超时流程：ModInvoke 在 3s 后返回 ErrTaskAwaitTimeout，同时启动一个后台
-// goroutine 等待任务完成后释放 ChanTask（actor_loader.go 中的清理路径）。
-// Slow 执行 3.5s，<-done 等调用方 goroutine 退出，再等 2s 让清理 goroutine 退出。
-// goleak 在 TestMain 中验证无泄漏。
-func TestNoLeakOnTimeout(t *testing.T) {
-	loader, stop := startLoader(t, "timeout")
-	defer stop()
+// --- 重压用例（ACTOR_STRESS=1） ---
 
-	// 单个慢任务，避免多个任务串行堆积拉长总等待时间。
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		loader.ModInvoke("slowMod", "Slow", 1, 2) //nolint:errcheck
-	}()
-	<-done // 调用方 goroutine 在 3s 超时后返回
+// TestExtremeManyConcurrentActors 同时拉起大批 actor 并交叉调用，
+// 对应"大量玩家同时在线"。每个 actor 一条 goroutine 加一个 1s ticker，
+// 这里要看的是它们能不能全部正常服务、并在收尾时干净退出。
+func TestExtremeManyConcurrentActors(t *testing.T) {
+	requireStress(t)
+	defer noLeak(t)()
 
-	// Slow 在 actor 内执行 3.5s，等 2s 确保 Slow 完成（共 5s > 3.5s）
-	// 并让清理 goroutine 在 <-doneCh 返回后退出
-	time.Sleep(2 * time.Second)
-}
+	const actors = 2000
+	base := runtime.NumGoroutine()
 
-// TestLoaderHealthyAfterTimeout 验证单次超时后 loader 仍可正常处理新请求。
-func TestLoaderHealthyAfterTimeout(t *testing.T) {
-	loader, stop := startLoader(t, "health-after-timeout")
-	defer stop()
-
-	go func() {
-		loader.ModInvoke("slowMod", "Slow", 1, 2) //nolint:errcheck
-	}()
-
-	// Slow 执行 3.5s，等待 4s 确保其在 actor 内执行完毕
-	time.Sleep(4 * time.Second)
-
-	out, err := loader.ModInvoke("slowMod", "Fast", 3, 4)
-	if err != nil {
-		t.Fatalf("loader unhealthy after timeout: %v", err)
+	hs := make([]*harness, actors)
+	for i := range hs {
+		hs[i] = newHarness(fmt.Sprintf("mesh-%d", i))
 	}
-	if len(out) != 1 || int(out[0].Int()) != 7 {
-		t.Fatalf("unexpected result: %v", out)
+	afterStart := runtime.NumGoroutine()
+
+	callers := runtime.NumCPU() * 2
+	const perCaller = 2000
+	var okCount, errCount int64
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	start := time.Now()
+	for c := 0; c < callers; c++ {
+		go func(c int) {
+			defer wg.Done()
+			gid := actor.CurrentGID()
+			for i := 0; i < perCaller; i++ {
+				// 用互质步长打散，让每个调用方均匀地敲遍所有 actor
+				h := hs[(c*7919+i*31)%actors]
+				out, err := h.loader.ModInvokeFrom(gid, gateName, "Echo", i)
+				if err != nil || len(out) != 1 || int(out[0].Int()) != i {
+					atomic.AddInt64(&errCount, 1)
+					continue
+				}
+				atomic.AddInt64(&okCount, 1)
+			}
+		}(c)
 	}
-}
+	waitAll(t, &wg, 180*time.Second, "多 actor 交叉调用")
+	elapsed := time.Since(start)
+	peak := runtime.NumGoroutine()
 
-// TestNoLeakOnClose 验证在有任务 in-flight 时关闭 loader，不泄漏 goroutine。
-//
-// 修复前行为：队列中未处理的任务的 done channel 永远不会关闭，
-// 导致清理 goroutine 永久挂起。
-// 修复后：RunUpdateLoop 关闭时 drain 队列，对所有未处理任务调用
-// complete(nil, errActorClosed)，done channel 被关闭，清理 goroutine 可正常退出。
-func TestNoLeakOnClose(t *testing.T) {
-	loader, stop := startLoader(t, "close-inflight")
-
-	go func() {
-		loader.ModInvoke("slowMod", "Slow", 1, 2) //nolint:errcheck
-	}()
-
-	// 给任务入队的时间
-	time.Sleep(100 * time.Millisecond)
-
-	// 在任务执行中途关闭；stop() 会等待 RunUpdateLoop 退出
-	// （若 Slow 正在执行则阻塞至 Slow 完成，约 3.5s）
-	stop()
-
-	// stop() 返回时 actor 已退出。若 Slow 是在 close 前开始执行的，
-	// 清理 goroutine 在 done 关闭后立即退出；等待 1s 作为调度缓冲。
-	time.Sleep(1 * time.Second)
-}
-
-// TestNoLeakHighConcurrencyTimeout 并发制造多个超时，验证无泄漏。
-//
-// Slow 执行 3.5s，actor 串行处理：2 个任务共需 7s。
-// wg.Wait() 在 3s（超时）后返回，再等 5s（共 8s > 7s），确保所有清理 goroutine 退出。
-func TestNoLeakHighConcurrencyTimeout(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipped in short mode")
+	for _, h := range hs {
+		h.stop()
 	}
 
-	loader, stop := startLoader(t, "hc-timeout")
-	defer stop()
+	t.Logf("%d 个 actor 同时在线：goroutine %d → %d（峰值 %d）；"+
+		"%d 个调用方共 %d 次调用耗时 %v，约 %.0f ops/s，失败 %d",
+		actors, base, afterStart, peak, callers, okCount+errCount, elapsed,
+		float64(okCount+errCount)/elapsed.Seconds(), errCount)
 
-	const workers = 2
+	if errCount != 0 {
+		t.Fatalf("多 actor 交叉调用出现 %d 次失败", errCount)
+	}
+	if afterStart-base < actors {
+		t.Fatalf("只起来了 %d 个 actor 协程，期望 %d", afterStart-base, actors)
+	}
+}
+
+// TestExtremeSingleActorThroughput 量单个 actor 的吞吐上限与延迟分布，
+// 同时暴露一个隐性成本：WithTimeout 起的 time.AfterFunc 在调用成功后不会被 Stop，
+// 于是每次跨协程调用都会让 ChanTask 及其两个 channel 多存活 3 秒。
+// 高吞吐下这就是内存与定时器堆的压力源——用例把两个时刻的堆占用都打出来。
+func TestExtremeSingleActorThroughput(t *testing.T) {
+	requireStress(t)
+	defer noLeak(t)()
+	h := newHarness("throughput")
+	defer h.stop()
+
+	workers := runtime.NumCPU()
+	const perWorker = 10000
+	total := workers * perWorker
+
+	var before, afterBurst, afterDrain runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+
+	lat := make([][]time.Duration, workers)
+	var errCount int64
 	var wg sync.WaitGroup
 	wg.Add(workers)
-
-	for i := 0; i < workers; i++ {
-		go func() {
+	start := time.Now()
+	for w := 0; w < workers; w++ {
+		go func(w int) {
 			defer wg.Done()
-			loader.ModInvoke("slowMod", "Slow", 1, 2) //nolint:errcheck
-		}()
+			gid := actor.CurrentGID()
+			buf := make([]time.Duration, 0, perWorker)
+			for i := 0; i < perWorker; i++ {
+				t0 := time.Now()
+				out, err := h.loader.ModInvokeFrom(gid, gateName, "Echo", i)
+				buf = append(buf, time.Since(t0))
+				if err != nil || len(out) != 1 || int(out[0].Int()) != i {
+					atomic.AddInt64(&errCount, 1)
+				}
+			}
+			lat[w] = buf
+		}(w)
 	}
-	wg.Wait() // 3s 后两个调用方均超时返回
+	waitAll(t, &wg, 180*time.Second, "单 actor 吞吐压测")
+	elapsed := time.Since(start)
+	runtime.ReadMemStats(&afterBurst)
 
-	// 2 个 Slow 串行执行共 7s，等待 5s（总计 8s > 7s）确保清理 goroutine 全部退出
-	time.Sleep(5 * time.Second)
+	all := make([]time.Duration, 0, total)
+	zeroSamples := 0
+	for _, b := range lat {
+		for _, d := range b {
+			if d == 0 {
+				zeroSamples++
+			}
+		}
+		all = append(all, b...)
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i] < all[j] })
+
+	t.Logf("%d 个调用方 × %d 次 = %d 次调用，耗时 %v，约 %.0f ops/s，单次均值 %v",
+		workers, perWorker, total, elapsed, float64(total)/elapsed.Seconds(),
+		elapsed/time.Duration(perWorker))
+	// 低分位常常量成 0：Windows 的单调时钟粒度（约 0.5~1ms）远大于单次调用耗时，
+	// 所以低分位只能说明"快到量不出来"，真正有信息量的是均值和高分位。
+	t.Logf("延迟 p50=%v p90=%v p99=%v p999=%v max=%v（%d/%d 个样本因时钟粒度量成 0）",
+		pct(all, 0.50), pct(all, 0.90), pct(all, 0.99), pct(all, 0.999), all[len(all)-1],
+		zeroSamples, total)
+	t.Logf("堆占用：压测前 %.1fMB → 压测刚结束 %.1fMB（此时 %d 个 3s 定时器仍未到期）",
+		float64(before.HeapAlloc)/(1<<20), float64(afterBurst.HeapAlloc)/(1<<20), total)
+
+	if errCount != 0 {
+		t.Fatalf("%d 次调用失败或结果串味", errCount)
+	}
+
+	// 等所有未 Stop 的定时器自然到期，确认那部分占用只是滞留、不是泄漏。
+	// 顺带也让 goleak 不至于撞上正在被 time.AfterFunc 拉起的短命协程。
+	time.Sleep(timeoutSlack)
+	runtime.GC()
+	runtime.ReadMemStats(&afterDrain)
+	t.Logf("定时器全部到期并 GC 后：%.1fMB", float64(afterDrain.HeapAlloc)/(1<<20))
+
+	if grow := int64(afterDrain.HeapAlloc) - int64(before.HeapAlloc); grow > 64<<20 {
+		t.Errorf("定时器到期后堆仍比压测前多 %.1fMB，疑似有对象没被释放",
+			float64(grow)/(1<<20))
+	}
 }

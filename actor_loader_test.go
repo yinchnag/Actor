@@ -3,7 +3,6 @@ package actor
 import (
 	"sync"
 	"testing"
-	"time"
 )
 
 type CalcMessage struct {
@@ -55,10 +54,7 @@ func TestActorLoaderCrossGoroutineInvoke(t *testing.T) {
 	owner.AddModule(mod)
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go owner.RunUpdateLoop(&wg)
-
-	time.Sleep(20 * time.Millisecond)
+	owner.Start(&wg) // 返回时 goroutineID 已发布，不需要 sleep 等启动
 	// Invoke is sent to owner's goroutine via channel (test goroutine != owner's goroutine).
 	out, err := owner.ModInvoke("CalcMod", "Sum", 7, 8)
 	if err != nil {
