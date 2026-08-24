@@ -2,6 +2,7 @@ package actor
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -322,5 +323,40 @@ func TestOrdinaryGoroutineCallerNotInWaitGraph(t *testing.T) {
 
 	if failed != 0 {
 		t.Fatalf("普通协程的调用被拦下了 %d 次：环检测误伤了非 actor 调用方", failed)
+	}
+}
+
+// registrySize 数一遍等待图的注册表。只有本包能看到它，所以这条断言只能写在这里。
+func registrySize() int {
+	n := 0
+	loaderRegistry.Range(func(_, _ any) bool { n++; return true })
+	return n
+}
+
+// TestLoaderRegistryClearedOnClose actor 关闭后必须从等待图的注册表里退出来。
+//
+// 这是环检测引入的一处新泄漏面，而且 goroutine 数看不见它：actor 上下线频繁的
+// 游戏服里，漏删一条就意味着注册表随在线人次无限膨胀，环检测回溯时还会一路
+// 走进早就死掉的 actor。
+func TestLoaderRegistryClearedOnClose(t *testing.T) {
+	before := registrySize()
+
+	const rounds = 500
+	for i := 0; i < rounds; i++ {
+		l := NewActorLoader(fmt.Sprintf("reg-%d", i))
+		l.Init()
+		l.AddModule(newCycleMod())
+		var wg sync.WaitGroup
+		l.Start(&wg)
+		if _, err := l.ModInvoke(cycleModName, "Echo", i); err != nil {
+			t.Fatalf("第 %d 轮调用失败: %v", i, err)
+		}
+		l.Close()
+		wg.Wait()
+	}
+
+	if after := registrySize(); after != before {
+		t.Fatalf("%d 轮建/停之后注册表残留 %d 条：actor 关闭时没退出等待图",
+			rounds, after-before)
 	}
 }

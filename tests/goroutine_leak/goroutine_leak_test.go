@@ -444,6 +444,184 @@ func TestUpdateTickerNotStarvedUnderLoad(t *testing.T) {
 	}
 }
 
+// --- 协议分发 ---
+//
+// OnMessageHandler + 协议注册是这套框架分发前端消息的主路径：协议 ID 与响应函数
+// 由 ModObj 在 Init 时自动绑定，省掉手写 switch。这条路径上每条消息都会走一次
+// 遍历模块 + ModInvoke，量大且高频，是最不该漏测的地方。
+
+type dispatchMsgA struct{ N int }
+type dispatchMsgB struct{ N int }
+
+const (
+	dispatchIDA = 9001
+	dispatchIDB = 9002
+)
+
+func init() {
+	actor.RegisterProtocol(dispatchIDA, dispatchMsgA{})
+	actor.RegisterProtocol(dispatchIDB, dispatchMsgB{})
+}
+
+// dispatchModA 只认 dispatchMsgA。ModObj 按"单入参 + 无返回值 + 入参类型已注册"
+// 三条把 OnDispatchA 识别成协议处理器，写进 metaMsgHandler。
+type dispatchModA struct {
+	actor.ModObj[*dispatchModA]
+	got atomic.Int64
+}
+
+func newDispatchModA() *dispatchModA {
+	m := &dispatchModA{}
+	m.Init()
+	return m
+}
+
+func (m *dispatchModA) OnDispatchA(msg dispatchMsgA) { m.got.Add(int64(msg.N)) }
+
+// Total 有返回值，用来做 FIFO 屏障。
+func (m *dispatchModA) Total() int { return int(m.got.Load()) }
+
+type dispatchModB struct {
+	actor.ModObj[*dispatchModB]
+	got atomic.Int64
+}
+
+func newDispatchModB() *dispatchModB {
+	m := &dispatchModB{}
+	m.Init()
+	return m
+}
+
+func (m *dispatchModB) OnDispatchB(msg dispatchMsgB) { m.got.Add(int64(msg.N)) }
+
+// TestNoLeakProtocolDispatch 并发灌协议消息，逐条对账。
+//
+// 协议处理器没有返回值，走的是"投递完就返回"的路径，任务由事件循环 complete 后
+// 自行 Release——丢一条就对不上账。而 OnMessageHandler 把 ModInvoke 的错误直接
+// 丢掉了（`_, _ =`），投递失败不会有任何声响，所以这里必须严格对账才看得见。
+func TestNoLeakProtocolDispatch(t *testing.T) {
+	defer noLeak(t)()
+
+	loader := actor.NewActorLoader("dispatch")
+	loader.Init()
+	modA, modB := newDispatchModA(), newDispatchModB()
+	loader.AddModule(modA)
+	loader.AddModule(modB)
+
+	var wg sync.WaitGroup
+	loader.Start(&wg)
+	defer func() {
+		loader.Close()
+		wg.Wait()
+	}()
+
+	// 先确认协议真的绑上了。少了这步，即使一条都没分发出去，下面的对账也可能"通过"。
+	if got := modA.GetMetaHandler(dispatchIDA); got != "OnDispatchA" {
+		t.Fatalf("协议 %d 没绑到 OnDispatchA, got %q", dispatchIDA, got)
+	}
+	if got := modB.GetMetaHandler(dispatchIDB); got != "OnDispatchB" {
+		t.Fatalf("协议 %d 没绑到 OnDispatchB, got %q", dispatchIDB, got)
+	}
+	// 模块之间不该串台：A 不认 B 的协议
+	if got := modA.GetMetaHandler(dispatchIDB); got != "" {
+		t.Fatalf("dispatchModA 不该认领协议 %d, got %q", dispatchIDB, got)
+	}
+
+	workers := runtime.NumCPU()
+	if workers < 4 {
+		workers = 4
+	}
+	const perWorker = 500
+
+	var sendWG sync.WaitGroup
+	sendWG.Add(workers)
+	start := time.Now()
+	for w := 0; w < workers; w++ {
+		go func(w int) {
+			defer sendWG.Done()
+			for i := 0; i < perWorker; i++ {
+				if w%2 == 0 {
+					loader.OnMessageHandler(actor.NewProtocolMessage(dispatchIDA, dispatchMsgA{N: 1}, nil))
+				} else {
+					loader.OnMessageHandler(actor.NewProtocolMessage(dispatchIDB, dispatchMsgB{N: 1}, nil))
+				}
+			}
+		}(w)
+	}
+	waitAll(t, &sendWG, 60*time.Second, "协议分发")
+	elapsed := time.Since(start)
+
+	// FIFO 屏障：这次同步调用返回时，排在它前面的协议任务必然都已执行完
+	if _, err := loader.ModInvoke("dispatchModA", "Total"); err != nil {
+		t.Fatalf("屏障调用失败: %v", err)
+	}
+
+	total := workers * perWorker
+	wantA := int64((workers + 1) / 2 * perWorker)
+	wantB := int64(workers / 2 * perWorker)
+	if got := modA.got.Load(); got != wantA {
+		t.Fatalf("协议 A 收到 %d 条，期望 %d 条——有消息被静默丢弃", got, wantA)
+	}
+	if got := modB.got.Load(); got != wantB {
+		t.Fatalf("协议 B 收到 %d 条，期望 %d 条——有消息被静默丢弃", got, wantB)
+	}
+	t.Logf("%d 条协议消息全部落地，耗时 %v，约 %.0f 条/秒（每条都要遍历模块并解析一次栈取 GID）",
+		total, elapsed, float64(total)/elapsed.Seconds())
+}
+
+// BenchmarkProtocolDispatch 与 BenchmarkProtocolDispatchDirect 拆开量协议分发的开销。
+//
+// 两者最终都只是往队列里投一个无返回值任务，差额全在 OnMessageHandler 自己身上：
+// 它每条消息都要在锁里把所有模块拷进一个新切片，再对每个命中的模块走一次 ModInvoke
+// （而 ModInvoke 又要 currentGID，即解析一次调用栈）。模块越多，这笔固定开销越大，
+// 而它落在每条前端消息上。
+//
+//	go test ./tests/goroutine_leak/ -bench=BenchmarkProtocolDispatch -benchmem -run XXX
+func BenchmarkProtocolDispatch(b *testing.B) {
+	loader, modA, stop := newDispatchActor("bench-dispatch")
+	defer stop()
+	_ = modA
+
+	msg := actor.NewProtocolMessage(dispatchIDA, dispatchMsgA{N: 1}, nil)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		loader.OnMessageHandler(msg)
+	}
+}
+
+// BenchmarkProtocolDispatchDirect 绕开 OnMessageHandler，直接投给已知的处理器，
+// 并复用缓存好的 GID——这是同一条投递路径的下限。
+func BenchmarkProtocolDispatchDirect(b *testing.B) {
+	loader, modA, stop := newDispatchActor("bench-dispatch-direct")
+	defer stop()
+
+	method := modA.GetMetaHandler(dispatchIDA)
+	gid := actor.CurrentGID()
+	msg := dispatchMsgA{N: 1}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := loader.ModInvokeFrom(gid, "dispatchModA", method, msg); err != nil {
+			b.Fatalf("invoke failed: %v", err)
+		}
+	}
+}
+
+func newDispatchActor(name string) (*actor.ActorLoader, *dispatchModA, func()) {
+	loader := actor.NewActorLoader(name)
+	loader.Init()
+	modA := newDispatchModA()
+	loader.AddModule(modA)
+	loader.AddModule(newDispatchModB())
+	var wg sync.WaitGroup
+	loader.Start(&wg)
+	return loader, modA, func() {
+		loader.Close()
+		wg.Wait()
+	}
+}
+
 // --- 需要等满框架 3s 超时的用例 ---
 
 // TestTimeoutStormNoLeakAndPoolIntegrity 同时压两条超时路径，再验池子有没有被串用。
@@ -465,7 +643,7 @@ func TestTimeoutStormNoLeakAndPoolIntegrity(t *testing.T) {
 	h.blockActor(t)
 
 	const callers = 200
-	var awaitTimeout, queueTimeout, other, unexpectedOK int64
+	var awaitTimeout, queueTimeout, other, unexpectedOK, canceled int64
 	var wg sync.WaitGroup
 	wg.Add(callers)
 	for i := 0; i < callers; i++ {
@@ -473,6 +651,9 @@ func TestTimeoutStormNoLeakAndPoolIntegrity(t *testing.T) {
 			defer wg.Done()
 			gid := actor.CurrentGID()
 			_, err := h.loader.ModInvokeFrom(gid, gateName, "Echo", i)
+			if errors.Is(err, actor.ErrTaskCanceled) {
+				atomic.AddInt64(&canceled, 1)
+			}
 			switch {
 			case err == nil:
 				atomic.AddInt64(&unexpectedOK, 1)
@@ -495,8 +676,24 @@ func TestTimeoutStormNoLeakAndPoolIntegrity(t *testing.T) {
 	if awaitTimeout == 0 || queueTimeout == 0 {
 		t.Fatalf("没能同时压到两条超时路径（64 槽 vs %d 个调用方）", callers)
 	}
+	// 入队成功那批（awaitTimeout 个）应当已经被调用方标成取消，全都带 ErrTaskCanceled；
+	// 卡在投递上那批压根没进队列，不存在取消一说。
+	if canceled != awaitTimeout {
+		t.Fatalf("%d 个入队后超时的调用里只有 %d 个被就地取消", awaitTimeout, canceled)
+	}
 
+	// 放行前先记账：那批被取消的任务还躺在队列里，事件循环恢复后必须逐个跳过。
+	echoedBefore := h.mod.echoed.Load()
 	h.mod.release()
+
+	// FIFO 屏障：这次调用排在所有被取消的任务后面，它一返回就说明那批全被处理过了。
+	if _, err := h.loader.ModInvoke(gateName, "Echo", -1); err != nil {
+		t.Fatalf("放行后的屏障调用失败: %v", err)
+	}
+	if got, want := h.mod.echoed.Load(), echoedBefore+1; got != want {
+		t.Fatalf("方法体被执行了 %d 次，期望 %d 次——被取消的任务补跑了 %d 次",
+			got, want, got-want)
+	}
 
 	const checkers, perChecker = 8, 400
 	var mismatch int64
@@ -520,6 +717,54 @@ func TestTimeoutStormNoLeakAndPoolIntegrity(t *testing.T) {
 	if mismatch != 0 {
 		t.Fatalf("风暴过后有 %d 个调用拿错了结果：ChanTask 池被串用了", mismatch)
 	}
+}
+
+// TestNoLeakCloseDrainsAbandonedTasks 覆盖"被取消的任务还躺在队列里时关闭 actor"。
+//
+// 调用方超时后把任务标成 Abandoned 就走了，任务本身还排在队列里等着被跳过。
+// 这时候关闭 actor，排空必须能结算 Abandoned 状态的任务——complete 若只认 Pending，
+// done 就永远不会关闭，每个被取消的任务都会永久挂住一个清理协程，
+// ChanTask 也全都回不了池。
+func TestNoLeakCloseDrainsAbandonedTasks(t *testing.T) {
+	if testing.Short() {
+		t.Skip("需要等满框架默认的 3s 超时，-short 下跳过")
+	}
+	defer noLeak(t)()
+	h := newHarness("close-abandoned")
+	defer h.stop()
+
+	h.blockActor(t)
+
+	const callers = 40 // 小于 64 槽，保证全部入队成功、随后全部被取消
+	var canceled int64
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func(i int) {
+			defer wg.Done()
+			gid := actor.CurrentGID()
+			_, err := h.loader.ModInvokeFrom(gid, gateName, "Echo", i)
+			if errors.Is(err, actor.ErrTaskCanceled) {
+				atomic.AddInt64(&canceled, 1)
+			}
+		}(i)
+	}
+	waitAll(t, &wg, 10*time.Second, "调用方超时并取消各自的任务")
+	if canceled != callers {
+		t.Fatalf("只有 %d/%d 个任务被就地取消，用例前提不成立", canceled, callers)
+	}
+
+	// 不放行 Block，直接关闭：队列里全是 Abandoned 状态的任务，
+	// 事件循环还卡着，只能由 closeWith 这一侧的排空来结算它们。
+	h.loader.Close()
+
+	h.mod.release() // 放行 Block，事件循环才退得出来
+	h.wg.Wait()
+
+	if got := h.mod.echoed.Load(); got != 0 {
+		t.Fatalf("被取消的任务执行了 %d 次，一次都不该执行", got)
+	}
+	t.Logf("%d 个被取消的任务在关闭排空中完成结算，方法体一次都没跑", canceled)
 }
 
 // --- 跨 actor / 重入 ---
@@ -662,6 +907,91 @@ func TestCrossActorCycleRejectedWithoutLeak(t *testing.T) {
 	}
 	if got := mb.calls.Load(); got != rounds+1 {
 		t.Fatalf("b 执行了 %d 次 Ping，期望 %d 次", got, rounds+1)
+	}
+}
+
+// TestNoLeakCloseActorAwaitedByAnotherActor 关闭一个正被另一个 actor 同步等待的 actor。
+//
+// 这是最容易漏的一处交织：a 的事件循环卡在等 b 的返回值上——此刻 a 自己的队列
+// 也没人消费，a 事实上整个停摆了。关闭 b 时，排空必须把 a 那个还排在 b 队列里的
+// 任务结算掉，a 才能醒过来；漏了的话 a 要干等满 3s，期间它自己的调用方全部被拖住，
+// a 的等待边也一直挂在环检测的等待图上，别人查图会一路走进一个已经死掉的 actor。
+func TestNoLeakCloseActorAwaitedByAnotherActor(t *testing.T) {
+	defer noLeak(t)()
+
+	var wg sync.WaitGroup
+
+	// b 同时挂两个模块：relayMod 接 a 的同步调用，gateMod 用来把 b 的事件循环钉死，
+	// 好让 a 那个任务只能排队。
+	b := actor.NewActorLoader("awaited-b")
+	b.Init()
+	bGate := newGateMod()
+	b.AddModule(newRelayMod()) // peer 为 nil，Ping 到此为止
+	b.AddModule(bGate)
+	b.Start(&wg)
+
+	a := actor.NewActorLoader("awaited-a")
+	a.Init()
+	ma := newRelayMod()
+	ma.peer = b
+	a.AddModule(ma)
+	a.Start(&wg)
+
+	defer func() {
+		bGate.release()
+		a.Close()
+		b.Close()
+		wg.Wait()
+	}()
+
+	// 1) 钉死 b 的事件循环
+	go b.ModInvoke(gateName, "Block", 1) //nolint:errcheck
+	select {
+	case <-bGate.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("b 的事件循环没能进入 Block")
+	}
+
+	// 2) a 的事件循环去同步问 b 要结果，任务排在 Block 后面，a 就此停摆
+	outerErr := make(chan error, 1)
+	go func() {
+		out, err := a.ModInvoke(relayName, "Ping", 1)
+		if err != nil {
+			outerErr <- err
+			return
+		}
+		inner, _ := out[1].Interface().(error)
+		outerErr <- inner
+	}()
+	// 没有可观测的"已入队"信号，给一小段时间让 a 的调用落进 b 的队列。
+	// 断言本身不依赖这个时长的精度。
+	time.Sleep(100 * time.Millisecond)
+
+	// 3) 关掉 b。a 那个任务还在 b 的队列里，只能靠排空结算
+	start := time.Now()
+	b.Close()
+
+	select {
+	case err := <-outerErr:
+		if err == nil {
+			t.Fatal("b 已经关闭，a 的调用不该成功")
+		}
+		if errors.Is(err, actor.ErrTaskAwaitTimeout) {
+			t.Fatalf("a 等满了超时才返回（%v）：关闭 b 时漏了结算它队列里的任务",
+				time.Since(start))
+		}
+		t.Logf("b 关闭后 %v 内 a 就被唤醒，拿到 %v", time.Since(start), err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("b 关闭后 a 仍未被唤醒")
+	}
+
+	// 4) a 必须立刻恢复服务——它自己没被关，只是刚才被钉住了
+	out, err := a.ModInvoke(relayName, "Ping", 0)
+	if err != nil {
+		t.Fatalf("a 在对端关闭后不可用: %v", err)
+	}
+	if int(out[0].Int()) != 0 {
+		t.Fatalf("a 状态异常: %v", out)
 	}
 }
 
