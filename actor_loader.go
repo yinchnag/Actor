@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"runtime"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,6 +70,22 @@ type ActorLoader struct {
 	modulesMu sync.RWMutex
 	modules   map[string]IModule
 	closeOnce sync.Once
+
+	// dispatchIndex 是「协议 ID → 处理它的模块方法」的只读快照。
+	// AddModule 持 modulesMu 写锁整体重建，再原子换上；分发侧只做一次原子读。
+	//
+	// 之所以做成整体替换而不是就地改：分发路径上的 ModInvoke 会再次获取
+	// modulesMu（directInvoke/shouldWaitResult 里都要 GetModule），
+	// 所以分发绝不能持着 modulesMu。原来的写法是先把模块列表拷一份出来再放锁，
+	// 每条消息一次分配、一次 O(模块数) 的遍历。换成只读快照之后，
+	// 分发既不用加锁也不用拷贝，复杂度还从 O(模块数) 降到 O(该协议的处理器数)。
+	dispatchIndex atomic.Pointer[map[int][]dispatchTarget]
+}
+
+// dispatchTarget 是一条解析好的分发路径，建索引时算一次，之后只读。
+type dispatchTarget struct {
+	modName    string
+	methodName string
 }
 
 // maxWaitChainWalk 限制等待图的回溯深度。正常的调用链远到不了这个数，
@@ -255,7 +272,36 @@ func (that *ActorLoader) AddModule(mod IModule) {
 	}
 	that.modulesMu.Lock()
 	that.modules[mod.GameName()] = mod
+	that.rebuildDispatchIndex()
 	that.modulesMu.Unlock()
+}
+
+// rebuildDispatchIndex 重建协议分发索引，调用方必须持有 modulesMu 写锁。
+//
+// 整表重建而不是增量更新：AddModule 只在启动装配时调用，重建成本无所谓；
+// 换来的是分发侧永远读到一张完整、此后不再改动的表，不需要任何锁。
+func (that *ActorLoader) rebuildDispatchIndex() {
+	idx := make(map[int][]dispatchTarget, len(that.modules))
+	for name, mod := range that.modules {
+		// 可选接口，与 shouldWaitResult 里的 GetNumOut 同一套路：
+		// 嵌了 ModObj 的模块自动具备；手写的 IModule 只是享受不到索引，不会坏。
+		h, ok := mod.(interface{ MetaHandlers() map[int]string })
+		if !ok {
+			continue
+		}
+		for msgID, method := range h.MetaHandlers() {
+			if method == "" {
+				continue
+			}
+			idx[msgID] = append(idx[msgID], dispatchTarget{modName: name, methodName: method})
+		}
+	}
+	// 同一个协议被多个模块认领时，按模块名定序。
+	// 原来靠 map 迭代，每条消息的派发顺序都不一样；定序之后行为才可复现。
+	for _, targets := range idx {
+		sort.Slice(targets, func(i, j int) bool { return targets[i].modName < targets[j].modName })
+	}
+	that.dispatchIndex.Store(&idx)
 }
 
 func (that *ActorLoader) GetModule(name string) IModule {
@@ -372,23 +418,18 @@ func (that *ActorLoader) OnMessageHandler(p IProtocol) {
 		return
 	}
 
-	that.modulesMu.RLock()
-	mods := make([]IModule, 0, len(that.modules))
-	for _, m := range that.modules {
-		mods = append(mods, m)
+	idx := that.dispatchIndex.Load()
+	if idx == nil {
+		return // 还没 AddModule 过，没有任何处理器
 	}
-	that.modulesMu.RUnlock()
+	targets := (*idx)[p.GetMessageID()]
+	if len(targets) == 0 {
+		return
+	}
 
-	msgID := p.GetMessageID()
 	msg := p.GetMessage()
-
-	for _, mod := range mods {
-		methodName := mod.GetMetaHandler(msgID)
-		if methodName == "" {
-			continue
-		}
-		// already on the actor's own goroutine — pass its GID directly to skip currentGID()
-		_, _ = that.ModInvoke(mod.GameName(), methodName, msg)
+	for _, t := range targets {
+		_, _ = that.ModInvoke(t.modName, t.methodName, msg)
 	}
 }
 

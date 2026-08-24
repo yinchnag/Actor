@@ -28,6 +28,7 @@ var baseMethodSet = map[string]struct{}{
 	"SetDirty":       {},
 	"GetNumOut":      {},
 	"GetNumIn":       {},
+	"MetaHandlers":   {},
 }
 
 func (that *ModObj[T]) SetStorage(storage IStorage) {
@@ -153,6 +154,17 @@ func (that *ModObj[T]) GetMetaHandler(msg int) string {
 		return ""
 	}
 	return that.metaMsgHandler[msg]
+}
+
+// MetaHandlers 返回本模块认领的全部「协议 ID → 处理方法」。
+//
+// 供 ActorLoader 在 AddModule 时一次性建好分发索引：分发路径就不必再逐个模块
+// 问 GetMetaHandler，也就不必为了问而先把模块列表拷一份出来。
+//
+// 返回的是内部 map 本身，调用方只读、不得修改。它在 Init 里建好之后不再变动，
+// 所以这样共享是安全的。
+func (that *ModObj[T]) MetaHandlers() map[int]string {
+	return that.metaMsgHandler
 }
 
 func (that *ModObj[T]) IsDirty() bool {
