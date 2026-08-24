@@ -31,6 +31,15 @@ var (
 	//
 	//	if errors.Is(err, ErrTaskCanceled) { retry() }
 	ErrTaskCanceled = errors.New("task canceled before execution")
+	// ErrCallCycle 表示这次跨 actor 的同步调用会绕回一个已经在等待中的 actor，
+	// 放进去必然死锁。事件循环是单消费者，一旦卡在 Await 上就消费不了自己的队列，
+	// 对端回调过来的任务只能干躺着——环上每一环都等满 defaultTaskTimeout 才解开。
+	//
+	// 检测出来就立刻失败，把"整条环停摆 3 秒"降级成"当场报错"。
+	// 任务根本没有被创建和投递，模块方法确定没有执行。
+	// 但注意这跟 ErrTaskCanceled 不是一回事：重试解决不了环，得改调用结构
+	// （拆成无返回值的异步回调，或者调整分层不让调用成环）。
+	ErrCallCycle = errors.New("cross-actor call cycle detected")
 	// ErrActorNotStarted 表示事件循环尚未启动，且调用方不是启动前的唯一持有者。
 	// 用 Start 启动 actor 可以彻底避免这个错误。
 	ErrActorNotStarted = errors.New("actor not started")
@@ -47,11 +56,63 @@ type ActorLoader struct {
 	taskChan     chan ITask
 	stopChan     chan struct{}
 
+	// waitingFor 是本 actor 的事件循环当前正在等待结果的那个 actor 的循环 GID，
+	// 0 表示没在等。它是环检测的全部状态：谁在等谁，连起来就是一张等待图，
+	// 图上出现回边就是死锁。
+	//
+	// 只有"要等返回值"的跨 actor 调用才会写它——那种调用会把事件循环整个钉住，
+	// 是唯一能构成等待边的情形。无返回值调用投递完就走，不进这张图。
+	waitingFor atomic.Uint64
+
 	// enqueueMu 让投递与排空互斥：enqueueTask 持读锁投递，closeWith 持写锁排空。
 	enqueueMu sync.RWMutex
 	modulesMu sync.RWMutex
 	modules   map[string]IModule
 	closeOnce sync.Once
+}
+
+// maxWaitChainWalk 限制等待图的回溯深度。正常的调用链远到不了这个数，
+// 走满了就保守放行，交给 defaultTaskTimeout 兜底——宁可漏检一次多等 3 秒，
+// 也不能因为图走岔了就把合法调用拦下来。
+const maxWaitChainWalk = 64
+
+// loaderRegistry 把事件循环的 goroutine ID 映射回 loader，供环检测反查调用方。
+// 只在 SetGoroutineID 与关闭时写，其余全是读，用 sync.Map 避开读锁竞争。
+var loaderRegistry sync.Map // uint64 -> *ActorLoader
+
+func loaderByGID(gid uint64) *ActorLoader {
+	if gid == 0 {
+		return nil
+	}
+	if v, ok := loaderRegistry.Load(gid); ok {
+		return v.(*ActorLoader)
+	}
+	return nil
+}
+
+// wouldDeadlock 判断"callerGID 这条事件循环再去等 targetGID 的结果"会不会成环。
+// 从目标出发顺着 waitingFor 一路往下走：绕回调用方，就说明这次调用一放进去，
+// 环上每一环都在等下一环，谁也动不了。
+//
+// 只有 actor 的事件循环才会进这张图，普通业务协程等待不会钉住任何队列，
+// 所以查不到 loader 就直接判定链断了。
+func wouldDeadlock(targetGID, callerGID uint64) bool {
+	g := targetGID
+	for i := 0; i < maxWaitChainWalk; i++ {
+		l := loaderByGID(g)
+		if l == nil {
+			return false // 不是已注册的 actor（或已关闭），链到此为止
+		}
+		w := l.waitingFor.Load()
+		if w == 0 {
+			return false // 这一环没在等人，链断了
+		}
+		if w == callerGID {
+			return true // 绕回了调用方
+		}
+		g = w
+	}
+	return false
 }
 
 func NewActorLoader(name string) *ActorLoader {
@@ -83,7 +144,14 @@ func (that *ActorLoader) SetGoroutineID(role string) {
 	if id == 0 {
 		id = uint64(time.Now().UnixNano())
 	}
-	atomic.StoreUint64(&that.goroutineID, id)
+	old := atomic.SwapUint64(&that.goroutineID, id)
+	if old != 0 && old != id {
+		loaderRegistry.Delete(old)
+	}
+	// 注册进 GID→loader 表，环检测才能从 callerGID 反查到调用方 actor。
+	// 这次 Store 排在 that.name 与 goroutineID 的写之后，读方通过注册表或
+	// 原子读到非零 goroutineID 都能看到完整的初始化结果。
+	loaderRegistry.Store(id, that)
 }
 
 func (that *ActorLoader) GetTaskChan() chan<- ITask {
@@ -100,6 +168,12 @@ func (that *ActorLoader) closeWith(drainErr error) {
 	that.closeOnce.Do(func() {
 		that.closed.Store(true) // 此后进入 enqueueTask 的投递方会被挡在 RLock 内
 		close(that.stopChan)    // 唤醒已经卡在 select 里的投递方，避免下面干等
+
+		// 退出等待图。关掉的 actor 不再接活，留在图里只会让别人多走一段冤枉路；
+		// actor 频繁创建销毁时不清理还会让注册表无限膨胀。
+		if gid := atomic.LoadUint64(&that.goroutineID); gid != 0 {
+			loaderRegistry.Delete(gid)
+		}
 
 		// 写锁与 enqueueTask 的读锁互斥：拿到它就意味着没有任何投递方还在
 		// 临界区内，也不会再有新的进来。只有在这个前提下排空，队列里剩下的
@@ -229,6 +303,25 @@ func (that *ActorLoader) ModInvokeFrom(callerGID uint64, modName, methodName str
 	// 轻则拿到脏值，重则误判成"要等结果"，去 Await 并 Release 一个不属于自己的任务。
 	// handleTask/drainTask 里同样是先取快照再 complete，这里遵循同一条纪律。
 	waitResult := that.shouldWaitResult(modName, methodName)
+
+	// 环检测只管"要等返回值"的调用：只有它会把调用方的事件循环钉住，
+	// 也只有它能构成等待边。无返回值调用投递完就返回，进不了等待图，
+	// 自然也不会被误伤——环上只要有一处是异步的，环就断了。
+	if waitResult {
+		if src := loaderByGID(callerGID); src != nil {
+			// 调用方是另一个 actor 的事件循环。先公布"我要等谁"再检查：
+			// 两个 actor 同时互调时，这个顺序保证至少有一方能看见对方的意图，
+			// 不会双双漏检（代价是可能双双拒绝，那是安全的方向）。
+			src.waitingFor.Store(gid)
+			defer src.waitingFor.Store(0)
+
+			if wouldDeadlock(gid, callerGID) {
+				src.waitingFor.Store(0) // 这次不会真的等了，立刻退出等待图
+				return nil, fmt.Errorf("%w: actor %s 等 actor %s 的返回值会绕回自己",
+					ErrCallCycle, src.name, that.name)
+			}
+		}
+	}
 
 	task := NewChanTask(callerGID, gid, modName, methodName, args...)
 	task.SetWaitResult(waitResult)

@@ -598,23 +598,17 @@ func TestCrossActorChainNoDeadlock(t *testing.T) {
 	}
 }
 
-// TestCrossActorCycleDeadlocksUntilTimeout 固化框架的一条硬边界：
-// 两个 actor 互相同步调用会死锁，只能靠 3s 超时解开。
+// TestCrossActorCycleRejectedWithoutLeak 覆盖环检测这条路径的资源收尾。
 //
-// a 的协程执行 Ping 时卡在等 b 的结果上，此刻 a 的事件循环停摆、
-// 消费不了任何任务；b 回调 a 的那个任务就一直躺在 a 的队列里。
-// 这不是 bug，是"同步跨 actor 调用"的固有代价——但它必须以超时收场，
-// 而不是永久挂死，且超时之后两个 actor 都要能继续干活。
+// 两个 actor 互相同步调用是这套框架的一条硬边界：a 的事件循环卡在等 b 的结果时
+// 消费不了自己的队列，b 回调过来的任务只能干躺着。以前只能等满 defaultTaskTimeout
+// 才解开，整条环停摆 3 秒；现在由等待图当场拦下。
 //
-// 还有一个容易踩空的细节：环上每一层的 3s 计时几乎同时起跑，谁先到期取决于
-// 定时器精度（Windows 上尤其粗），所以收场有两种，且是随机的——
-// 要么最外层自己超时，要么内层的超时先解开、把错误一路传回来。
-// 无论哪种，上游看到的都只是"3 秒没回话"，无从区分对端是慢还是环形死锁。
-// 用例把两种都算通过，只钉死"必须以 ErrTaskAwaitTimeout 收场、且不永久挂死"。
-func TestCrossActorCycleDeadlocksUntilTimeout(t *testing.T) {
-	if testing.Short() {
-		t.Skip("需要等满框架默认的 3s 超时，-short 下跳过")
-	}
+// 这里关心的是拦下之后有没有留下垃圾：被拒的调用根本没建任务、没投递，
+// 不该有 ChanTask 漏出池，也不该有清理协程挂着；两个 actor 还得立刻能干活。
+// 检测语义本身（两环、三环、异步回调不误伤、同时互调）在根包的
+// actor_loader_cycle_test.go 里确定性覆盖。
+func TestCrossActorCycleRejectedWithoutLeak(t *testing.T) {
 	defer noLeak(t)()
 
 	var wg sync.WaitGroup
@@ -634,55 +628,40 @@ func TestCrossActorCycleDeadlocksUntilTimeout(t *testing.T) {
 		wg.Wait()
 	}()
 
-	start := time.Now()
-	out, err := a.ModInvoke(relayName, "Ping", 2)
-	elapsed := time.Since(start)
-
-	settled, where := err, "外层调用方自己超时"
-	if err == nil {
-		if len(out) != 2 {
-			t.Fatalf("返回值个数异常: %d", len(out))
+	// 反复撞环，把"每撞一次漏一点"的问题放大出来
+	const rounds = 200
+	for i := 0; i < rounds; i++ {
+		start := time.Now()
+		out, err := a.ModInvoke(relayName, "Ping", 2)
+		if err != nil {
+			t.Fatalf("第 %d 轮外层调用不该失败: %v", i, err)
 		}
-		settled, _ = out[1].Interface().(error)
-		where = "内层先超时并把错误传了回来"
+		inner, _ := out[1].Interface().(error)
+		if !errors.Is(inner, actor.ErrCallCycle) {
+			t.Fatalf("第 %d 轮环形调用应当被拦下，got %v", i, inner)
+		}
+		if d := time.Since(start); d > time.Second {
+			t.Fatalf("第 %d 轮耗时 %v：退化成超时兜底了", i, d)
+		}
 	}
-	if !errors.Is(settled, actor.ErrTaskAwaitTimeout) {
-		t.Fatalf("环形同步调用应当以 Await 超时收场，got %v", settled)
-	}
-	if elapsed < 2500*time.Millisecond {
-		t.Fatalf("没走到超时路径？elapsed=%v", elapsed)
-	}
-	t.Logf("跨 actor 环形同步调用死锁，%v 后由超时解开（本次是%s；3s 上限写死在框架里，不可配）",
-		elapsed, where)
 
-	// 兜底之后两个 actor 都要恢复正常。
-	// a 的队列里还压着 b 那个被搁置的回调，它排在下面这次调用前面（FIFO），
-	// 所以下面调用一旦返回，就能确定那个回调已经被事件循环处理过了——
-	// 至于是执行还是跳过，看下面。
+	// 撞完环两个 actor 都要立刻可用
 	for name, l := range map[string]*actor.ActorLoader{"a": a, "b": b} {
 		out, err := l.ModInvoke(relayName, "Ping", 0)
 		if err != nil {
-			t.Fatalf("actor %s 死锁解开后不可用: %v", name, err)
+			t.Fatalf("actor %s 在环被拦下后不可用: %v", name, err)
 		}
 		if int(out[0].Int()) != 0 {
-			t.Fatalf("actor %s 死锁解开后状态异常", name)
+			t.Fatalf("actor %s 状态异常", name)
 		}
 	}
 
-	// 被搁置的回调（b 打给 a 的 Ping(0)）走哪条路，取决于环上哪个定时器先到期，
-	// 而这跟上面外层/内层谁先超时是同一个随机性：
-	//   - b 先超时 → 它抢在 a 的事件循环认领之前取消掉任务，方法不执行（共 2 次）
-	//   - a 先超时 → a 的循环先恢复并认领了它，正常执行，b 也如愿拿到结果（共 3 次）
-	// 两种都对：要害在于任何一次执行都有人接收结果，不存在"调用方走了还补跑一遍"。
-	// 取消语义本身由根包的 TestModInvokeTimeoutCancelsQueuedTask 确定性覆盖。
-	calls := ma.calls.Load()
-	switch calls {
-	case 2:
-		t.Log("被搁置的回调在事件循环取到它之前就被取消了，方法没有补跑")
-	case 3:
-		t.Log("事件循环先恢复并认领了被搁置的回调，正常执行，调用方也拿到了结果")
-	default:
-		t.Fatalf("a 执行了 %d 次 Ping，只可能是 2（回调被取消）或 3（回调被认领执行）", calls)
+	// 被拒的那一跳压根没执行到 b 的模块方法体，a 只执行了每轮的 Ping(2) 加最后一次健康检查
+	if got, want := ma.calls.Load(), int64(rounds+1); got != want {
+		t.Fatalf("a 执行了 %d 次 Ping，期望 %d 次", got, want)
+	}
+	if got := mb.calls.Load(); got != rounds+1 {
+		t.Fatalf("b 执行了 %d 次 Ping，期望 %d 次", got, rounds+1)
 	}
 }
 

@@ -123,6 +123,38 @@ func (m *MyModule) OnMyProtocol(msg MyProtocolMessage) {
   - For hot-path code: cache the GID once with CurrentGID() and use ModInvokeFrom to avoid repeated runtime.Stack calls
   - Returns results immediately on same-goroutine, blocks with 3-second timeout on cross-goroutine if method has return values
 
+### Cross-Actor Call Cycles
+
+The event loop is a **single consumer**: while a module method blocks in `Await` waiting on
+another actor, that actor's own `taskChan` is not being drained. So a synchronous call cycle
+(`A→B→A`, `A→B→C→A`) deadlocks every actor on the cycle until each hop's timeout expires.
+
+`ActorLoader` maintains a **wait graph** to catch this at call time:
+
+- Each loader publishes `waitingFor` — the loop GID of the actor it is currently blocked on
+  (0 = not waiting). Only calls that wait for a return value write it; fire-and-forget calls
+  never enter the graph.
+- `loaderRegistry` (a `sync.Map` keyed by loop GID) lets `ModInvokeFrom` resolve `callerGID`
+  back to the calling actor. Loaders register in `SetGoroutineID` and deregister in `closeWith`.
+- Before enqueuing a blocking call, the caller publishes its intent and then walks the graph
+  from the target via `wouldDeadlock`. If the walk comes back to the caller, the call fails
+  immediately with `ErrCallCycle` — no task is created, nothing is enqueued.
+
+Publish-then-check ordering guarantees that two actors calling each other simultaneously
+cannot both miss the cycle (they may both reject, which is the safe direction).
+
+**Consequences for callers**:
+- `ErrCallCycle` is not retryable — fix the call structure instead (make one hop a
+  no-return-value call, or layer actors so calls only go one direction).
+- A cycle with any fire-and-forget hop is *not* a deadlock and is deliberately allowed:
+  "handle the request, then push a notification back to the caller" keeps working even while
+  the caller is blocked on you.
+- Calls from ordinary goroutines (network handlers, workers) never enter the graph — blocking
+  such a goroutine does not stall any event loop.
+- Not covered: a loop blocked on something that is not another actor (a mutex, IO, a channel).
+  No wait edge exists, so the cycle is invisible and `defaultTaskTimeout` remains the backstop.
+  Same for enqueue blocking on a full `taskChan`.
+
 ### Protocol & Message Routing
 
 **Protocol Registry**: Global maps link message IDs to Go types
