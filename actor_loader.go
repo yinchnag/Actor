@@ -366,9 +366,25 @@ func (that *ActorLoader) AddModule(mod IModule) {
 		return
 	}
 	that.modulesMu.Lock()
-	that.modules[mod.GameName()] = mod
+	defer that.modulesMu.Unlock()
+
+	// 兜底调一次 Init：模块的构造函数忘了调也照样能工作。
+	// Init 是幂等的，构造时已经调过就是空操作——这一点很重要，
+	// 否则对已注册且正在服务的模块再 AddModule 一次会重建方法表，
+	// 与事件循环的读并发（见 ModObj.Init 的注释）。
+	mod.Init()
+
+	name := mod.GameName()
+	if name == "" {
+		// 反射绑定没成功。最常见的原因是 ModObj 的类型参数写错了，
+		// 比如 type Foo struct{ ModObj[*Bar] }——heir 指针反推不出来，方法表是空的。
+		// 这种模块永远不可能被调用到，静默注册只会让人在运行期对着
+		// "module not found" 排查半天，不如启动就炸。
+		panic(fmt.Sprintf("actor: 模块 %T 没有模块名，反射绑定失败——"+
+			"请检查 ModObj 的类型参数是否就是宿主类型本身", mod))
+	}
+	that.modules[name] = mod
 	that.rebuildDispatchIndex()
-	that.modulesMu.Unlock()
 }
 
 // rebuildDispatchIndex 重建协议分发索引，调用方必须持有 modulesMu 写锁。

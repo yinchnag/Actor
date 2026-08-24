@@ -35,7 +35,19 @@ func (that *ModObj[T]) SetStorage(storage IStorage) {
 	that.storage = storage
 }
 
+// Init 绑定宿主指针并反射登记方法表。可以重复调用，第二次起是空操作。
+//
+// 幂等是必须的，不只是省一次反射：AddModule 会兜底调一次 Init，而模块的构造函数
+// 通常也自己调过。若每次都重建 invokers/metaMsgHandler，对一个**已经注册、
+// 正在被事件循环调用**的模块再 AddModule 一次，就会在别人读方法表的同时把它整个换掉——
+// 读方（shouldWaitResult → GetNumOut、handleTask → Invoke）并不持有 modulesMu，
+// 那是实打实的数据竞争。
+//
+// 方法表在编译期就定死了，本来也没有重建的必要。
 func (that *ModObj[T]) Init() {
+	if that.invokers != nil {
+		return
+	}
 	that.invokers = map[string]*FuncHandler{}
 	that.metaMsgHandler = map[int]string{}
 	that.bindHeirByOffset()
