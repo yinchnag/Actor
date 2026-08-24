@@ -159,6 +159,39 @@ func TestDispatchIndexRebuiltOnAddModule(t *testing.T) {
 	}
 }
 
+// TestOnMessageHandlerFromEquivalent 缓存 GID 的入口必须与自己取 GID 的入口
+// 派发结果完全一致——它只是把 currentGID 那一步交给调用方，语义不能有任何差别。
+func TestOnMessageHandlerFromEquivalent(t *testing.T) {
+	loader := NewActorLoader("dispatch-from")
+	loader.Init()
+	late := newLateMod()
+	loader.AddModule(late)
+
+	var wg sync.WaitGroup
+	loader.Start(&wg)
+	defer func() {
+		loader.Close()
+		wg.Wait()
+	}()
+
+	gid := CurrentGID()
+	const rounds = 10
+	for i := 0; i < rounds; i++ {
+		loader.OnMessageHandler(NewProtocolMessage(lateMsgID, lateMsg{N: 1}, nil))
+		loader.OnMessageHandlerFrom(gid, NewProtocolMessage(lateMsgID, lateMsg{N: 1}, nil))
+	}
+	// 未注册协议与 nil 消息，两个入口都必须是空操作
+	loader.OnMessageHandlerFrom(gid, NewProtocolMessage(999999, lateMsg{N: 1}, nil))
+	loader.OnMessageHandlerFrom(gid, nil)
+
+	if _, err := loader.ModInvokeFrom(gid, "lateMod", "Total"); err != nil {
+		t.Fatalf("屏障调用失败: %v", err)
+	}
+	if got := late.got.Load(); got != rounds*2 {
+		t.Fatalf("两个入口共派发 %d 条，期望 %d 条", got, rounds*2)
+	}
+}
+
 // TestDispatchUnknownProtocolIsNoop 没人认领的协议 ID 直接丢弃，不能误派发也不能崩。
 func TestDispatchUnknownProtocolIsNoop(t *testing.T) {
 	loader := NewActorLoader("unknown-proto")

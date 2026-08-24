@@ -161,14 +161,71 @@ cannot both miss the cycle (they may both reject, which is the safe direction).
 - RegisterProtocol(msgID, sampleInstance) caches the type
 - MessageIDByType(t reflect.Type) looks up ID by type (used by ModObj to auto-register handlers)
 
-**OnMessageHandler(IProtocol)**: Dispatches incoming protocol messages
-- Iterates all modules, checks if each has a handler for the message ID
-- Routes to handler via ModInvoke (respects same/cross-goroutine logic)
+**OnMessageHandler(IProtocol)** / **OnMessageHandlerFrom(callerGID, IProtocol)**: Dispatches incoming protocol messages
+- Looks the message ID up in `dispatchIndex`, a read-only snapshot built by `AddModule`
+  (one atomic load + one map lookup — no locking, no allocation, independent of module count)
+- Routes each target via `ModInvokeFrom` (respects same/cross-goroutine logic)
+- When several modules claim the same message ID, they are dispatched in module-name order
+- **Hot path**: the GID is resolved once per *message*, not once per handler. Long-lived
+  receive goroutines (network readers, message pumps) should cache it once and use
+  `OnMessageHandlerFrom` — that removes the `runtime.Stack` call entirely:
+
+  ```go
+  gid := actor.CurrentGID()
+  for msg := range conn.Recv() {
+      loader.OnMessageHandlerFrom(gid, msg)
+  }
+  ```
+
+  Measured on a 2-module actor: `OnMessageHandler` 3529 ns/op / 8 allocs vs
+  `OnMessageHandlerFrom` 790 ns/op / 7 allocs — the latter matches a hand-written
+  direct `ModInvokeFrom`, i.e. dispatch itself costs essentially nothing.
+
+### Discarded Errors (no-return-value calls)
+
+Protocol handlers and fire-and-forget `ModInvoke` calls have no caller waiting on a result, so
+a failure has nowhere to be returned. Both failure points are reported through one channel:
+
+- **`PhaseDeliver`** — never reached the module method: enqueue failed (`ErrTaskQueueTimeout`,
+  actor closed), or the task was queued but drained at shutdown without running.
+- **`PhaseInvoke`** — reached the method and the call itself failed: argument type mismatch,
+  method not found, or a panic. This one used to be completely invisible — for a fire-and-forget
+  task the error was stored in `task.Err` and went back to the pool unread, so e.g. dispatching
+  a message whose payload type doesn't match the registered protocol type made the message
+  vanish with no error and no crash.
+
+```go
+loader.SetDiscardedErrorHandler(func(e actor.DiscardedError) {
+    metrics.Inc("actor.discarded", e.Phase.String())
+    log.Warnf("%v", e)                       // e.ModName / e.MethodName / e.Err
+})
+n := loader.DiscardedErrors()                // 累计计数，供监控采样
+```
+
+- The handler runs **synchronously on whichever goroutine hit the failure** — the caller's
+  goroutine for `PhaseDeliver`, the actor's own event loop for `PhaseInvoke`. Keep it cheap;
+  never call back into the same actor from it.
+- With no handler installed, the framework logs to stderr **rate-limited to one line per second**
+  (a full queue would otherwise flood the log). The counter is always exact.
+- `DiscardedError` implements `Unwrap`, so `errors.Is(e, ErrTaskQueueTimeout)` works.
+- A message ID that no module claims is *not* an error — it is dropped silently by design
+  (broadcasting to many actors where only some care is normal).
 
 ### Goroutine ID Tracking
 
-- currentGID(): Parses goroutine ID from runtime.Stack() output (expensive, only call once per goroutine lifetime)
-- CurrentGID(): Public wrapper; cache its result and pass to ModInvokeFrom for hot-path efficiency
+- currentGID(): Parses the goroutine ID out of runtime.Stack() output. **~1730 ns/op, 1 alloc**,
+  of which ~1550 ns is runtime.Stack itself walking the stack — that part is irreducible.
+  The parse reads the digits straight out of the byte buffer (no string conversion, no
+  strings.Fields), so only the 64-byte buffer allocates; it escapes because runtime.Stack
+  takes a []byte.
+- CurrentGID(): Public wrapper. **The optimization is not to make this faster, it is to not
+  call it.** Cache it once per long-lived goroutine and pass it to ModInvokeFrom /
+  OnMessageHandlerFrom.
+- Inside a module method you never need it at all: the method already runs on the actor's own
+  goroutine, so `loader.GetGoroutineID()` (one atomic load) is the same value. Measured on
+  500-level reentrant recursion: 266 µs/level via ModInvoke vs 421 ns/level via
+  ModInvokeFrom(GetGoroutineID()) — the gap widens with stack depth, because runtime.Stack
+  walks the whole stack.
 - SetGoroutineID(role string) in ActorLoader: Initializes the loader's goroutine ID and role name
 - Task status check: compares source GID with loader's stored goroutine ID to decide direct vs. enqueue
 
@@ -244,7 +301,17 @@ loader.OnMessageHandler(msg)
 
 ## Performance Considerations
 
-- **GID caching**: currentGID() parses runtime.Stack and is expensive. For loops calling ModInvoke repeatedly, capture the GID once and use ModInvokeFrom to avoid overhead. Reduces call overhead from ~5,840 ns/op to ~2,750 ns/op (2.1x speedup).
+- **GID caching**: currentGID() parses runtime.Stack and costs ~1730 ns. For any goroutine that
+  calls in repeatedly, capture the GID once and use the `*From` variants:
+  - `ModInvoke` ~7000 ns/op / 14 allocs → `ModInvokeFrom` ~2560 ns/op / 13 allocs
+  - `OnMessageHandler` ~3529 ns/op / 8 allocs → `OnMessageHandlerFrom` ~790 ns/op / 7 allocs
+  - inside a module method: `ModInvokeFrom(loader.GetGoroutineID(), ...)` — three orders of
+    magnitude cheaper than ModInvoke on deep stacks
+
+- **Protocol dispatch**: `AddModule` builds a `msgID -> handlers` snapshot published via
+  atomic.Pointer, so dispatch never touches `modulesMu` and never allocates. Just the lookup
+  segment: 2 modules 64 ns / 1 alloc → 2.2 ns / 0 alloc; 30 modules 488 ns / 480 B / 1 alloc →
+  4.7 ns / 0 alloc. Dispatch cost is now independent of how many modules an actor carries.
 
 - **Task pooling**: ChanTask uses sync.Pool to reuse allocations. Always call Release() to return tasks to the pool.
 

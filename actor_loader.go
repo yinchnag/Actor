@@ -11,8 +11,6 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -80,6 +78,12 @@ type ActorLoader struct {
 	// 每条消息一次分配、一次 O(模块数) 的遍历。换成只读快照之后，
 	// 分发既不用加锁也不用拷贝，复杂度还从 O(模块数) 降到 O(该协议的处理器数)。
 	dispatchIndex atomic.Pointer[map[int][]dispatchTarget]
+
+	// 无返回值调用失败时的出口。没有调用方在等结果，错误无处可返，
+	// 不记一笔就等于消息凭空消失。
+	discardedCount   atomic.Uint64
+	discardedHandler atomic.Pointer[DiscardedErrorFunc]
+	discardedLogAt   atomic.Int64 // 上次兜底日志的时间戳，用于限流
 }
 
 // dispatchTarget 是一条解析好的分发路径，建索引时算一次，之后只读。
@@ -87,6 +91,52 @@ type dispatchTarget struct {
 	modName    string
 	methodName string
 }
+
+// ErrorPhase 指出失败发生在哪一步。两者的处置方式完全不同：
+// 送不到通常是运行时压力（队列打满、actor 已关闭），执行失败基本都是编码问题
+// （协议 ID 与消息类型对不上、方法签名不匹配）。
+type ErrorPhase int8
+
+const (
+	// PhaseDeliver 消息没能送到模块方法手里：投递失败，或投递成功但 actor
+	// 在取用之前就关闭了。方法一次都没执行。
+	PhaseDeliver ErrorPhase = iota
+	// PhaseInvoke 已经送到并开始执行，是方法调用本身失败了。
+	PhaseInvoke
+)
+
+func (p ErrorPhase) String() string {
+	if p == PhaseInvoke {
+		return "invoke"
+	}
+	return "deliver"
+}
+
+// DiscardedError 是一次没人接收的调用失败。
+//
+// 无返回值的调用——协议派发、fire-and-forget 的 ModInvoke——按定义就没有调用方
+// 在等结果，出了错也没有任何地方可以返回。不主动报出来，消息就是彻底静默地消失。
+//
+// 方法名足以定位是哪条协议：ModObj 给每个协议 ID 只绑一个处理方法。
+type DiscardedError struct {
+	Phase      ErrorPhase
+	ModName    string
+	MethodName string
+	Err        error
+}
+
+func (e DiscardedError) Error() string {
+	return fmt.Sprintf("%s %s.%s failed: %v", e.Phase, e.ModName, e.MethodName, e.Err)
+}
+
+// Unwrap 让 errors.Is 能穿透到底层原因，比如 ErrTaskQueueTimeout。
+func (e DiscardedError) Unwrap() error { return e.Err }
+
+// DiscardedErrorFunc 是丢弃回调。它在发现失败的那条协程上**同步**执行：
+// 投递阶段是调用方协程，执行阶段是 actor 自己的事件循环。
+// 所以务必轻量——在里面做阻塞 I/O 会拖慢投递，回调进同一个 actor 更会直接把
+// 事件循环卡死。要落盘或上报，请自己丢进队列异步处理。
+type DiscardedErrorFunc func(DiscardedError)
 
 // maxWaitChainWalk 限制等待图的回溯深度。正常的调用链远到不了这个数，
 // 走满了就保守放行，交给 defaultTaskTimeout 兜底——宁可漏检一次多等 3 秒，
@@ -175,6 +225,50 @@ func (that *ActorLoader) GetTaskChan() chan<- ITask {
 	return that.taskChan
 }
 
+// SetDiscardedErrorHandler 接管无返回值调用的失败，传 nil 可以取消接管。
+//
+// 不接管时框架会往 stderr 打兜底日志，但限流到每秒一条：队列打满时一条消息一行
+// 会瞬间把日志淹掉，而"完全不吭声"比丢弃本身更糟——上层根本不知道消息没到。
+// 计数器不受限流影响，始终精确。
+func (that *ActorLoader) SetDiscardedErrorHandler(h DiscardedErrorFunc) {
+	if h == nil {
+		that.discardedHandler.Store(nil)
+		return
+	}
+	that.discardedHandler.Store(&h)
+}
+
+// DiscardedErrors 返回累计的丢弃次数，供监控采样。
+func (that *ActorLoader) DiscardedErrors() uint64 {
+	return that.discardedCount.Load()
+}
+
+// reportDiscarded 记一次丢弃。计数永远精确，日志限流，回调优先。
+func (that *ActorLoader) reportDiscarded(phase ErrorPhase, modName, methodName string, err error) {
+	if err == nil {
+		return
+	}
+	e := DiscardedError{Phase: phase, ModName: modName, MethodName: methodName, Err: err}
+	total := that.discardedCount.Add(1)
+
+	if h := that.discardedHandler.Load(); h != nil {
+		(*h)(e)
+		return
+	}
+
+	now := time.Now().UnixNano()
+	last := that.discardedLogAt.Load()
+	if now-last < int64(time.Second) {
+		return
+	}
+	// CAS 失败说明刚有人打过这一秒的日志，让给它
+	if !that.discardedLogAt.CompareAndSwap(last, now) {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "actor %s: 已丢弃 %d 次无返回值调用，最近一次: %v\n",
+		that.name, total, e)
+}
+
 func (that *ActorLoader) Close() {
 	that.closeWith(errActorClosed)
 }
@@ -258,7 +352,8 @@ func (that *ActorLoader) drainTask(err error) {
 		select {
 		case task := <-that.taskChan:
 			if ct, ok := task.(*ChanTask); ok {
-				settleTask(ct, nil, err)
+				// 投递进来了却没轮到执行，对无返回值调用来说同样是消息丢失
+				that.settleTask(ct, PhaseDeliver, task.GetModName(), task.GetMethodName(), nil, err)
 			}
 		default:
 			return
@@ -413,23 +508,66 @@ func (that *ActorLoader) claimInitOwner(callerGID uint64) bool {
 	return atomic.LoadUint64(&that.initOwnerGID) == callerGID
 }
 
+// OnMessageHandler 把协议消息派发给认领它的模块方法。
+//
+// 前端消息是最高频的入口，而它每次都要解析一遍调用栈取 GID（约 4µs，
+// 比投递本身贵好几倍）。长期存活的接收协程（网络读协程、消息泵）应当用
+// CurrentGID() 缓存一次，改走 OnMessageHandlerFrom，把这笔开销彻底省掉。
 func (that *ActorLoader) OnMessageHandler(p IProtocol) {
 	if p == nil {
 		return
 	}
+	// 先确认真有处理器再去解析栈：没人认领的协议一次 runtime.Stack 都不该花。
+	targets, msg, ok := that.dispatchTargets(p)
+	if !ok {
+		return
+	}
+	that.dispatch(currentGID(), targets, msg)
+}
 
+// OnMessageHandlerFrom 用预先取好的 callerGID 派发协议消息。
+// 长期存活的调用协程应当只取一次 GID 然后一直复用：
+//
+//	gid := actor.CurrentGID()
+//	for msg := range conn.Recv() {
+//	    loader.OnMessageHandlerFrom(gid, msg)
+//	}
+func (that *ActorLoader) OnMessageHandlerFrom(callerGID uint64, p IProtocol) {
+	if p == nil {
+		return
+	}
+	targets, msg, ok := that.dispatchTargets(p)
+	if !ok {
+		return
+	}
+	that.dispatch(callerGID, targets, msg)
+}
+
+// dispatchTargets 查出该派发给谁。索引是只读快照，这里只做一次原子读加一次查表，
+// 不碰 modulesMu——分发路径上的 ModInvoke 还要再拿它。
+func (that *ActorLoader) dispatchTargets(p IProtocol) ([]dispatchTarget, IMessage, bool) {
 	idx := that.dispatchIndex.Load()
 	if idx == nil {
-		return // 还没 AddModule 过，没有任何处理器
+		return nil, nil, false // 还没 AddModule 过，没有任何处理器
 	}
 	targets := (*idx)[p.GetMessageID()]
 	if len(targets) == 0 {
-		return
+		return nil, nil, false
 	}
+	return targets, p.GetMessage(), true
+}
 
-	msg := p.GetMessage()
+// dispatch 逐个投递。GID 由调用方给定，一条消息只取一次——
+// 原来是每个命中的模块各解析一遍栈，模块越多越亏。
+//
+// 返回值确实没有意义（协议处理器按定义就没有返回值），但错误有：
+// 投递不进去就意味着这条前端消息被丢了，必须留下痕迹。
+// 至于送达之后执行阶段的失败，发生在事件循环那侧，由 settleTask 负责上报。
+func (that *ActorLoader) dispatch(callerGID uint64, targets []dispatchTarget, msg IMessage) {
 	for _, t := range targets {
-		_, _ = that.ModInvoke(t.modName, t.methodName, msg)
+		if _, err := that.ModInvokeFrom(callerGID, t.modName, t.methodName, msg); err != nil {
+			that.reportDiscarded(PhaseDeliver, t.modName, t.methodName, err)
+		}
 	}
 }
 
@@ -447,8 +585,18 @@ func (that *ActorLoader) directInvoke(modName, methodName string, args ...any) (
 // 等在上面的调用方随时可能把任务 Release 回池、被别人重新拿去用，
 // 之后再读 task 的任何字段都是读别人的任务。
 // 无返回值的任务没人等结果，回收责任就在结算这一侧。
-func settleTask(ct *ChanTask, results []reflect.Value, err error) {
+//
+// 也正因为没人等结果，它的错误在这里是最后一次被看见的机会：
+// complete 之后 err 只存在 task.Err 里，随任务一起回池，谁也读不到了。
+// 有返回值的任务不用管——调用方会自己拿到 err。
+// phase 由调用方给定：排空时任务根本没被取用过（PhaseDeliver），
+// 执行完或执行中出错才是 PhaseInvoke。混为一谈会让排查方向完全走偏——
+// 一个是过载/关闭，一个是代码有问题。
+func (that *ActorLoader) settleTask(ct *ChanTask, phase ErrorPhase, modName, methodName string, results []reflect.Value, err error) {
 	waitResult := ct.ShouldWaitResult()
+	if !waitResult && err != nil {
+		that.reportDiscarded(phase, modName, methodName, err)
+	}
 	ct.complete(results, err)
 	if !waitResult {
 		ct.Release()
@@ -459,7 +607,8 @@ func (that *ActorLoader) handleTask(task ITask) {
 	defer func() {
 		if r := recover(); r != nil {
 			if ct, ok := task.(*ChanTask); ok {
-				settleTask(ct, nil, fmt.Errorf("panic: %v", r))
+				that.settleTask(ct, PhaseInvoke, task.GetModName(), task.GetMethodName(),
+					nil, fmt.Errorf("panic: %v", r))
 			}
 			that.Close()
 		}
@@ -473,13 +622,14 @@ func (that *ActorLoader) handleTask(task ITask) {
 		// 认领失败：调用方在事件循环取到它之前就等超时并作废了它。
 		// 跳过模块方法——这正是"超时即取消"要的效果。但仍然要结算，
 		// 好让等在 <-done 上的清理协程退出、任务回池。
-		settleTask(ct, nil, ErrTaskCanceled)
+		that.settleTask(ct, PhaseDeliver, ct.GetModName(), ct.GetMethodName(), nil, ErrTaskCanceled)
 		return
 	}
 
-	results, err := that.directInvoke(task.GetModName(), task.GetMethodName(), task.GetArgs()...)
+	modName, methodName := task.GetModName(), task.GetMethodName()
+	results, err := that.directInvoke(modName, methodName, task.GetArgs()...)
 	if ct != nil {
-		settleTask(ct, results, err)
+		that.settleTask(ct, PhaseInvoke, modName, methodName, results, err)
 	}
 }
 
@@ -548,17 +698,33 @@ func CurrentGID() uint64 {
 	return currentGID()
 }
 
+// currentGID 解析当前协程的 ID。
+//
+// 这个函数很贵：runtime.Stack 会走一遍调用栈，实测在几微秒量级，
+// 比一次跨协程投递本身还贵。凡是能缓存 GID 的地方都该缓存，
+// 走 ModInvokeFrom / OnMessageHandlerFrom，别让它进热路径。
+//
+// 既然躲不掉的调用还是有，就把 runtime.Stack 之外的开销榨干：
+// 直接在字节上取数字，不转 string、不用 strings.Fields——
+// 那两步是每次调用两次堆分配，而 runtime.Stack 本身是零分配的。
 func currentGID() uint64 {
-	buf := make([]byte, 64)
-	n := runtime.Stack(buf, false)
-	line := string(buf[:n])
-	parts := strings.Fields(line)
-	if len(parts) < 2 || parts[0] != "goroutine" {
+	// 栈上的固定数组，不逃逸。64 字节足够放下 "goroutine <id> [" 这个前缀，
+	// runtime.Stack 会把写不下的部分直接丢掉。
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+
+	// 首行形如 "goroutine 123 [running]:"
+	const prefix = "goroutine "
+	if n < len(prefix) || string(buf[:len(prefix)]) != prefix {
 		return 0
 	}
-	id, err := strconv.ParseUint(parts[1], 10, 64)
-	if err != nil {
-		return 0
+	var id uint64
+	i := len(prefix)
+	for ; i < n && buf[i] >= '0' && buf[i] <= '9'; i++ {
+		id = id*10 + uint64(buf[i]-'0')
+	}
+	if i == len(prefix) {
+		return 0 // 前缀后面一个数字都没有
 	}
 	return id
 }

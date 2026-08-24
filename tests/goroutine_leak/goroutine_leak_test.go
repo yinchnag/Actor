@@ -590,6 +590,22 @@ func BenchmarkProtocolDispatch(b *testing.B) {
 	}
 }
 
+// BenchmarkProtocolDispatchFrom 走缓存 GID 的分发入口。
+// 与上面的差额就是 currentGID 那一次 runtime.Stack——长期存活的网络读协程
+// 只要把 GID 缓存一次，这笔钱就完全不用付。
+func BenchmarkProtocolDispatchFrom(b *testing.B) {
+	loader, _, stop := newDispatchActor("bench-dispatch-from")
+	defer stop()
+
+	msg := actor.NewProtocolMessage(dispatchIDA, dispatchMsgA{N: 1}, nil)
+	gid := actor.CurrentGID()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		loader.OnMessageHandlerFrom(gid, msg)
+	}
+}
+
 // BenchmarkProtocolDispatchDirect 绕开 OnMessageHandler，直接投给已知的处理器，
 // 并复用缓存好的 GID——这是同一条投递路径的下限。
 func BenchmarkProtocolDispatchDirect(b *testing.B) {
@@ -614,6 +630,10 @@ func newDispatchActor(name string) (*actor.ActorLoader, *dispatchModA, func()) {
 	modA := newDispatchModA()
 	loader.AddModule(modA)
 	loader.AddModule(newDispatchModB())
+	// 收尾时关闭 actor，队列里还没跑完的消息会被判为丢弃。这里接管掉，
+	// 免得框架的兜底 stderr 日志插进基准输出把结果行冲散。
+	var discarded atomic.Int64
+	loader.SetDiscardedErrorHandler(func(actor.DiscardedError) { discarded.Add(1) })
 	var wg sync.WaitGroup
 	loader.Start(&wg)
 	return loader, modA, func() {
