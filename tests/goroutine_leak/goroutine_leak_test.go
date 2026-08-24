@@ -835,9 +835,13 @@ func TestExtremeManyConcurrentActors(t *testing.T) {
 }
 
 // TestExtremeSingleActorThroughput 量单个 actor 的吞吐上限与延迟分布，
-// 同时暴露一个隐性成本：WithTimeout 起的 time.AfterFunc 在调用成功后不会被 Stop，
-// 于是每次跨协程调用都会让 ChanTask 及其两个 channel 多存活 3 秒。
-// 高吞吐下这就是内存与定时器堆的压力源——用例把两个时刻的堆占用都打出来。
+// 同时守住一条容易退化的内存性质：ChanTask 拿到结果后必须把超时定时器 Stop 掉。
+//
+// 不 Stop 的话，每次跨协程调用都会留下一个要等满 3s 才到期的定时器，
+// 闭包连带把 ChanTask 和它的两个 channel 一起吊住——压测期间堆会被顶得很高
+// （这台机器上 28 万次调用曾把堆从 45MB 顶到 172MB，还带出 79ms 的 GC 长尾），
+// 而 Stop 之后同样的压测只多出 2MB 出头。用例对压测中的堆增量设了上限，
+// 万一哪天 Stop 被去掉，这里会先炸。
 func TestExtremeSingleActorThroughput(t *testing.T) {
 	requireStress(t)
 	defer noLeak(t)()
@@ -897,22 +901,30 @@ func TestExtremeSingleActorThroughput(t *testing.T) {
 	t.Logf("延迟 p50=%v p90=%v p99=%v p999=%v max=%v（%d/%d 个样本因时钟粒度量成 0）",
 		pct(all, 0.50), pct(all, 0.90), pct(all, 0.99), pct(all, 0.999), all[len(all)-1],
 		zeroSamples, total)
-	t.Logf("堆占用：压测前 %.1fMB → 压测刚结束 %.1fMB（此时 %d 个 3s 定时器仍未到期）",
-		float64(before.HeapAlloc)/(1<<20), float64(afterBurst.HeapAlloc)/(1<<20), total)
+	burstGrow := int64(afterBurst.HeapAlloc) - int64(before.HeapAlloc)
+	t.Logf("堆占用：压测前 %.1fMB → 压测刚结束 %.1fMB（%d 次调用共多出 %.1fMB，"+
+		"合每次在途调用 %.0fB）",
+		float64(before.HeapAlloc)/(1<<20), float64(afterBurst.HeapAlloc)/(1<<20),
+		total, float64(burstGrow)/(1<<20), float64(burstGrow)/float64(total))
 
 	if errCount != 0 {
 		t.Fatalf("%d 次调用失败或结果串味", errCount)
 	}
+	// 定时器若没被 Stop，这批调用会把堆顶高一两个数量级（实测 +127MB）。
+	// 阈值放到 64MB，留足 GC 时机和机器差异的裕量，只拦真正的退化。
+	if burstGrow > 64<<20 {
+		t.Errorf("压测期间堆多出 %.1fMB：ChanTask 的超时定时器多半没在成功路径上被 Stop",
+			float64(burstGrow)/(1<<20))
+	}
 
-	// 等所有未 Stop 的定时器自然到期，确认那部分占用只是滞留、不是泄漏。
-	// 顺带也让 goleak 不至于撞上正在被 time.AfterFunc 拉起的短命协程。
+	// 再等一个超时周期确认没有滞留：成功返回的调用不该在这段时间里
+	// 还挂着任何定时器，堆应当回到基线附近。
 	time.Sleep(timeoutSlack)
 	runtime.GC()
 	runtime.ReadMemStats(&afterDrain)
-	t.Logf("定时器全部到期并 GC 后：%.1fMB", float64(afterDrain.HeapAlloc)/(1<<20))
+	t.Logf("再等一个超时周期并 GC 后：%.1fMB", float64(afterDrain.HeapAlloc)/(1<<20))
 
 	if grow := int64(afterDrain.HeapAlloc) - int64(before.HeapAlloc); grow > 64<<20 {
-		t.Errorf("定时器到期后堆仍比压测前多 %.1fMB，疑似有对象没被释放",
-			float64(grow)/(1<<20))
+		t.Errorf("静置后堆仍比压测前多 %.1fMB，疑似有对象没被释放", float64(grow)/(1<<20))
 	}
 }
