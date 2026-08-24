@@ -50,7 +50,9 @@ ACTOR_STRESS=1 go test -run TestActorLoaderCrossGoroutineHighConcurrencyStabilit
 
 ### VS Code Integration
 All debug configurations and tasks are pre-configured in .vscode/launch.json and .vscode/tasks.json. Use Ctrl+Shift+D to open the Run and Debug panel or Ctrl+Shift+P to access tasks. Key configurations:
-- **Debug deadlock_demo**: Debug the cmd/deadlock_demo program
+- **Debug deadlock_demo**: stale — cmd/deadlock_demo no longer exists. The runnable program
+  under cmd/ is now `noteserver` (see cmd/noteserver/README.md); .vscode/launch.json still
+  points at the removed demo and needs updating if you use those configs.
 - **Test - Race detector**: Run tests with -race flag to catch data races
 
 ## Architecture & Core Concepts
@@ -83,6 +85,12 @@ func (m *MyModule) OnMyProtocol(msg MyProtocolMessage) {
 ```
 
 **ModObj[T] Design**:
+- `Init()` is idempotent — the second call is a no-op. `AddModule` calls it as a safety net,
+  so a constructor that forgets it still works. Idempotence is load-bearing, not just an
+  optimization: re-adding an already-serving module would otherwise rebuild its method table
+  while the event loop reads it (readers do not hold `modulesMu`).
+- `AddModule` panics if `GameName()` is empty — that means reflection binding failed and the
+  module could never be invoked; failing at startup beats a runtime `module not found`.
 - Uses unsafe pointer arithmetic to recover the embedding struct (heir) from field offset
 - Reflects all public methods (excluding base IModule methods) and stores in invokers map
 - Automatically identifies protocol handlers: methods with exactly 1 param whose type is in the protocol registry and 0 return values
@@ -325,4 +333,10 @@ loader.OnMessageHandler(msg)
 
 ## Chinese Documentation
 
-The original design requirements are in REAMD.md and 开发文档_基础版.md. These files explain the rationale for the CRTP pattern, protocol routing, and cross-goroutine task semantics.
+REAMDE.md is the framework usage guide and caveats — read it before writing module code;
+it covers the reflection registration rules, the error semantics, and the pitfalls that
+follow from the event loop being a single consumer (blocking calls, call cycles, GID caching,
+discarded-error handling, state not leaking out of a module).
+开发文档_基础版.md holds the original design requirements and explains the rationale for the
+CRTP pattern, protocol routing, and cross-goroutine task semantics.
+cmd/noteserver/ is a worked example (HTTP service on real MySQL + Redis) with its own README.
