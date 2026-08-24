@@ -656,8 +656,9 @@ func TestCrossActorCycleDeadlocksUntilTimeout(t *testing.T) {
 		elapsed, where)
 
 	// 兜底之后两个 actor 都要恢复正常。
-	// 注意 a 的队列里还压着 b 那个被搁置的回调，它排在下面这次调用前面（FIFO），
-	// 所以下面调用一旦返回，就能确定那个"迟到 3 秒"的任务也已经被执行掉了。
+	// a 的队列里还压着 b 那个被搁置的回调，它排在下面这次调用前面（FIFO），
+	// 所以下面调用一旦返回，就能确定那个回调已经被事件循环处理过了——
+	// 至于是执行还是跳过，看下面。
 	for name, l := range map[string]*actor.ActorLoader{"a": a, "b": b} {
 		out, err := l.ModInvoke(relayName, "Ping", 0)
 		if err != nil {
@@ -667,9 +668,21 @@ func TestCrossActorCycleDeadlocksUntilTimeout(t *testing.T) {
 			t.Fatalf("actor %s 死锁解开后状态异常", name)
 		}
 	}
-	// Ping(2) + b 迟到的回调 Ping(0) + 上面的健康检查 Ping(0) = 3 次
-	if got := ma.calls.Load(); got < 3 {
-		t.Fatalf("a 只执行了 %d 次 Ping：被搁置的回调没能补上", got)
+
+	// 被搁置的回调（b 打给 a 的 Ping(0)）走哪条路，取决于环上哪个定时器先到期，
+	// 而这跟上面外层/内层谁先超时是同一个随机性：
+	//   - b 先超时 → 它抢在 a 的事件循环认领之前取消掉任务，方法不执行（共 2 次）
+	//   - a 先超时 → a 的循环先恢复并认领了它，正常执行，b 也如愿拿到结果（共 3 次）
+	// 两种都对：要害在于任何一次执行都有人接收结果，不存在"调用方走了还补跑一遍"。
+	// 取消语义本身由根包的 TestModInvokeTimeoutCancelsQueuedTask 确定性覆盖。
+	calls := ma.calls.Load()
+	switch calls {
+	case 2:
+		t.Log("被搁置的回调在事件循环取到它之前就被取消了，方法没有补跑")
+	case 3:
+		t.Log("事件循环先恢复并认领了被搁置的回调，正常执行，调用方也拿到了结果")
+	default:
+		t.Fatalf("a 执行了 %d 次 Ping，只可能是 2（回调被取消）或 3（回调被认领执行）", calls)
 	}
 }
 

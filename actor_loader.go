@@ -22,6 +22,15 @@ const defaultTaskTimeout = 3 * time.Second
 var (
 	errActorClosed      = errors.New("actor is closed")
 	ErrTaskQueueTimeout = errors.New("task enqueue timeout")
+	// ErrTaskCanceled 与 ErrTaskAwaitTimeout 一起返回，表示等待超时时任务还排在
+	// 队列里没被取走，已经就地取消：模块方法确定一次都没执行。
+	//
+	// 这个区分对业务很关键。同样是超时，带 ErrTaskCanceled 的可以直接安全重试；
+	// 不带的说明方法可能正在执行或已经执行完（Go 打断不了正在跑的函数），
+	// 重试前必须自己去重，否则就是重复扣费、重复发奖。
+	//
+	//	if errors.Is(err, ErrTaskCanceled) { retry() }
+	ErrTaskCanceled = errors.New("task canceled before execution")
 	// ErrActorNotStarted 表示事件循环尚未启动，且调用方不是启动前的唯一持有者。
 	// 用 Start 启动 actor 可以彻底避免这个错误。
 	ErrActorNotStarted = errors.New("actor not started")
@@ -158,11 +167,7 @@ func (that *ActorLoader) drainTask(err error) {
 		select {
 		case task := <-that.taskChan:
 			if ct, ok := task.(*ChanTask); ok {
-				waitResult := ct.ShouldWaitResult()
-				ct.complete(nil, err)
-				if !waitResult {
-					ct.Release()
-				}
+				settleTask(ct, nil, err)
 			}
 		default:
 			return
@@ -236,6 +241,12 @@ func (that *ActorLoader) ModInvokeFrom(callerGID uint64, modName, methodName str
 	if waitResult {
 		err := task.WithTimeout(defaultTaskTimeout).Await()
 		if err != nil {
+			// 超时即取消：抢在事件循环认领之前把任务作废，模块方法就不会再执行。
+			// 调用方已经拿着超时错误走人了，这时候再跑一遍就是一次没人接收结果的
+			// 副作用。抢不到说明它已经在跑了，只能如实告诉调用方，别谎称已取消。
+			if task.abandon() {
+				err = fmt.Errorf("%w: %w", ErrTaskAwaitTimeout, ErrTaskCanceled)
+			}
 			done := task.done
 			go func(t *ChanTask, doneCh <-chan struct{}) {
 				<-doneCh
@@ -296,15 +307,25 @@ func (that *ActorLoader) directInvoke(modName, methodName string, args ...any) (
 	return mod.Invoke(methodName, args...)
 }
 
+// settleTask 结算一个任务，是所有结算路径的唯一出口。
+//
+// 顺序不能反：必须先把 waitResult 取成快照再 complete。complete 会关闭 done，
+// 等在上面的调用方随时可能把任务 Release 回池、被别人重新拿去用，
+// 之后再读 task 的任何字段都是读别人的任务。
+// 无返回值的任务没人等结果，回收责任就在结算这一侧。
+func settleTask(ct *ChanTask, results []reflect.Value, err error) {
+	waitResult := ct.ShouldWaitResult()
+	ct.complete(results, err)
+	if !waitResult {
+		ct.Release()
+	}
+}
+
 func (that *ActorLoader) handleTask(task ITask) {
 	defer func() {
 		if r := recover(); r != nil {
 			if ct, ok := task.(*ChanTask); ok {
-				waitResult := ct.ShouldWaitResult()
-				ct.complete(nil, fmt.Errorf("panic: %v", r))
-				if !waitResult {
-					ct.Release()
-				}
+				settleTask(ct, nil, fmt.Errorf("panic: %v", r))
 			}
 			that.Close()
 		}
@@ -313,13 +334,18 @@ func (that *ActorLoader) handleTask(task ITask) {
 		return
 	}
 
+	ct, _ := task.(*ChanTask)
+	if ct != nil && !ct.claimForRun() {
+		// 认领失败：调用方在事件循环取到它之前就等超时并作废了它。
+		// 跳过模块方法——这正是"超时即取消"要的效果。但仍然要结算，
+		// 好让等在 <-done 上的清理协程退出、任务回池。
+		settleTask(ct, nil, ErrTaskCanceled)
+		return
+	}
+
 	results, err := that.directInvoke(task.GetModName(), task.GetMethodName(), task.GetArgs()...)
-	if ct, ok := task.(*ChanTask); ok {
-		waitResult := ct.ShouldWaitResult()
-		ct.complete(results, err)
-		if !waitResult {
-			ct.Release()
-		}
+	if ct != nil {
+		settleTask(ct, results, err)
 	}
 }
 

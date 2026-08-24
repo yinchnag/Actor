@@ -97,7 +97,19 @@ func (m *MyModule) OnMyProtocol(msg MyProtocolMessage) {
 - When executed, results are filled in via complete(results, err)
 - If caller needs results, it blocks on Await() (with optional timeout via WithTimeout())
 - Tasks are pooled via sync.Pool for efficiency; always call Release() when done
-- Status: 0 (released), 1 (in-flight), 2 (completed)
+- Status (see `TaskStatus*` constants in chan_task.go):
+  - 0 `TaskStatusIdle` — in the pool, unused
+  - 1 `TaskStatusPending` — enqueued, waiting for the event loop to pick it up
+  - 2 `TaskStatusDone` — settled (executed, drained, or canceled)
+  - 3 `TaskStatusAbandoned` — caller timed out and canceled it; the event loop skips execution
+  - 4 `TaskStatusRunning` — claimed by the event loop, module method is executing
+- **Timeout means cancel**: `Pending → Running` (`claimForRun`, event loop) and
+  `Pending → Abandoned` (`abandon`, caller) are competing CAS operations — exactly one wins.
+  If the caller's `Await` times out while the task is still queued, the module method is
+  never executed, and the returned error wraps both `ErrTaskAwaitTimeout` and
+  `ErrTaskCanceled`. A timeout *without* `ErrTaskCanceled` means the method was already
+  running (Go cannot interrupt a running function), so side effects may have happened —
+  callers must dedupe before retrying.
 
 **ActorLoader (IModLoader)**: Main coordination hub for a goroutine:
 - Stores modules by name (via AddModule, GetModule)

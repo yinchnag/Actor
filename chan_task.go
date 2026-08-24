@@ -10,6 +10,24 @@ import (
 
 var ErrTaskAwaitTimeout = errors.New("task await timeout")
 
+// ChanTask 的状态机。跨协程流转，一律用原子操作读写：
+//
+//	Idle ──NewChanTask──▶ Pending ──事件循环认领──▶ Running ──complete──▶ Done ──Release──▶ Idle
+//	                         │                                             ▲
+//	                         └──调用方超时放弃(abandon)──▶ Abandoned ───────┘（跳过执行，直接结算）
+//
+// Pending→Running 与 Pending→Abandoned 是一对竞争的 CAS，只可能有一个赢：
+// 事件循环先到就照常执行，调用方先到就整个跳过。这是"超时即取消"的落点——
+// 调用方拿着超时错误走人之后，模块方法不该再被执行一遍，
+// 否则就是一次没人接收结果的副作用（重复扣费、重复发奖）。
+const (
+	TaskStatusIdle      int32 = 0 // 在池中，未被使用
+	TaskStatusPending   int32 = 1 // 已投递，等待事件循环取用
+	TaskStatusDone      int32 = 2 // 已结算：执行完毕、被排空或被取消
+	TaskStatusAbandoned int32 = 3 // 调用方已放弃，事件循环取到后跳过执行
+	TaskStatusRunning   int32 = 4 // 事件循环已认领，模块方法正在执行
+)
+
 var chanTaskPool = sync.Pool{
 	New: func() any {
 		return &ChanTask{}
@@ -51,7 +69,7 @@ func NewChanTask(sourceID, targetID uint64, modName, methodName string, args ...
 	task.Args = append(task.Args[:0], args...)
 	task.Results = task.Results[:0]
 	task.Err = nil
-	atomic.StoreInt32(&task.Status, 1)
+	atomic.StoreInt32(&task.Status, TaskStatusPending)
 	task.done = make(chan struct{})
 	task.ctxTimeOut = nil
 	task.timer = nil
@@ -154,21 +172,33 @@ func (that *ChanTask) Await() error {
 	}
 }
 
-func (that *ChanTask) cancel() {
-	if that.ctxTimeOut == nil {
-		return
-	}
-	select {
-	case that.ctxTimeOut <- struct{}{}:
-	default:
-	}
+// abandon 由调用方在等待超时后调用，抢在事件循环认领之前把任务作废。
+//
+// 返回 true 表示抢到了：模块方法确定一次都不会执行，调用方可以安全重试。
+// 返回 false 表示事件循环已经认领（正在执行或已执行完）——Go 没法打断一个
+// 正在运行的函数，副作用可能已经发生，调用方重试前要自己去重。
+func (that *ChanTask) abandon() bool {
+	return atomic.CompareAndSwapInt32(&that.Status, TaskStatusPending, TaskStatusAbandoned)
+}
+
+// claimForRun 由事件循环在执行模块方法之前调用，认领这个任务。
+// 返回 false 说明调用方已经放弃（或任务已被结算），此时必须跳过执行。
+func (that *ChanTask) claimForRun() bool {
+	return atomic.CompareAndSwapInt32(&that.Status, TaskStatusPending, TaskStatusRunning)
 }
 
 func (that *ChanTask) complete(results []reflect.Value, err error) {
-	// Only one goroutine is allowed to settle a task once.
-	// If status is no longer running(1), the task was already released/settled.
-	if !atomic.CompareAndSwapInt32(&that.Status, 1, 2) {
-		return
+	// 一个任务只允许被结算一次。Pending（排队时被排空）、Running（正常执行完）、
+	// Abandoned（跳过执行后收尾）三种状态都可以推到 Done；
+	// 已经是 Done 或已回池（Idle）说明轮不到自己，直接退出。
+	for {
+		st := atomic.LoadInt32(&that.Status)
+		if st == TaskStatusIdle || st == TaskStatusDone {
+			return
+		}
+		if atomic.CompareAndSwapInt32(&that.Status, st, TaskStatusDone) {
+			break
+		}
 	}
 
 	that.Results = append(that.Results[:0], results...)
@@ -196,7 +226,7 @@ func (that *ChanTask) Release() {
 	that.Args = that.Args[:0]
 	that.Results = that.Results[:0]
 	that.Err = nil
-	atomic.StoreInt32(&that.Status, 0)
+	atomic.StoreInt32(&that.Status, TaskStatusIdle)
 	that.ctxTimeOut = nil
 	that.done = nil
 	chanTaskPool.Put(that)
