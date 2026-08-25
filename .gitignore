@@ -1,0 +1,56 @@
+# ── 编译产物 ─────────────────────────────────────────────────────────
+
+# Windows 可执行文件与各平台动态库
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+
+# go test -c / -o 产出的测试二进制
+*.test
+*.test.exe
+
+# 覆盖率与性能剖析文件
+*.out
+*.prof
+*.pprof
+coverage.txt
+
+# 类 Unix 上 go build 的产物没有扩展名，而 git 没有"匹配无扩展名文件"的写法，
+# 只能按程序名逐个列。cmd/ 下新增程序时记得在这里补两行。
+#
+# 不用 /cmd/*/* 加一堆 ! 反选来偷懒：那种写法会把将来新增的 .json、.yaml
+# 之类一并静默忽略掉，排查起来非常费劲。宁可列得啰嗦一点，规则要可预测。
+/cmd/gercmd/gercmd
+/cmd/gercmd/gercmd_*
+/cmd/noteserver/noteserver
+/cmd/noteserver/noteserver_*
+/cmd/GameSvr/GameSvr
+/cmd/GameSvr/GameSvr_*
+
+# 在仓库根执行 go build ./cmd/xxx 时，产物会落在根目录
+/gercmd
+/noteserver
+/GameSvr
+
+# 约定的产物目录，如果以后改成统一往这里输出
+/bin/
+
+# ── 其它 ─────────────────────────────────────────────────────────────
+
+# 依赖目录（如果哪天用 vendor）
+/vendor/
+
+# 本机 IDE 的个人设置。.vscode/launch.json、tasks.json 是共享的调试配置，
+# 保持入库；这里只挡掉纯个人偏好。
+/.idea/
+*.iml
+.DS_Store
+
+# 注意：.env 目前是入库的，里面是本机开发用的占位口令（README 已写明）。
+# 如果要在里面放真实口令，取消下面这行的注释，并执行：
+#     git rm --cached .env
+# 同时留一份 .env.example 说明需要哪些键。
+# .env
