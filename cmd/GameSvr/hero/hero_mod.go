@@ -16,4 +16,6 @@ type HeroMod struct {
 	actor.ModObj[*HeroMod]
 }
 
+// 新增一个英雄
+//	export: HeroModAddHero
 func (that *HeroMod) AddHero(heroid int) {}
