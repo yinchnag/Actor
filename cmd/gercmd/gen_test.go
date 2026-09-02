@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -373,4 +374,90 @@ func TestGenOutPathUsesOutDir(t *testing.T) {
 	if res.OutPkg != "player" {
 		t.Fatalf("包名应当取自输出目录已有文件, got %q", res.OutPkg)
 	}
+}
+
+// TestGeneratedFacadesUpToDate 入库的门面文件必须与当前生成器的产出一致。
+//
+// 生成物漂移是没有症状的：编译照过、测试照绿，只有下次重新生成时才会冒出一堆
+// 没人认得的 diff——或者更糟，有人照着读了一份已经不作数的代码。仓库里的
+// bag_export.go 就曾带着一次模板试验留下的注释入库，没有任何东西发现。
+//
+// 这条同时是 AST 层的回归网：动 GCore、动模板、动类型渲染，只要产出变了就先红。
+// 真要改，跑一遍 gen 把门面重新生成，连同改动一起提交即可。
+func TestGeneratedFacadesUpToDate(t *testing.T) {
+	const root = "../GameSvr"
+	outDir := filepath.Join(root, "player")
+	if _, err := os.Stat(outDir); err != nil {
+		t.Skipf("找不到 %s，跳过: %v", outDir, err)
+	}
+
+	var modFiles []string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && strings.HasSuffix(d.Name(), "_mod.go") {
+			modFiles = append(modFiles, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("遍历 %s 失败: %v", root, err)
+	}
+	// 一个都没找到就该失败：静默跳过等于这条测试白写，
+	// 而"模块文件不叫 _mod.go 了"恰恰是最该被发现的那类变化。
+	if len(modFiles) == 0 {
+		t.Fatalf("%s 下没有任何 *_mod.go，规范变了还是路径错了？", root)
+	}
+
+	for _, modFile := range modFiles {
+		t.Run(filepath.Base(modFile), func(t *testing.T) {
+			// DryRun：只算内容不落盘，这条测试绝不改动仓库
+			res, err := GenerateExports(modFile, outDir, GenOptions{DryRun: true})
+			if err != nil {
+				t.Fatalf("生成失败: %v", err)
+			}
+
+			want, err := os.ReadFile(res.OutPath)
+			if err != nil {
+				t.Fatalf("读不到入库的门面文件 %s——模块加了但门面没生成？%v", res.OutPath, err)
+			}
+
+			gotText, wantText := normalizeEOL(res.Content), normalizeEOL(want)
+			if gotText == wantText {
+				return
+			}
+			line, a, b := firstDiffLine(wantText, gotText)
+			t.Errorf("%s 与生成器的产出不一致（第 %d 行）\n"+
+				"  入库: %s\n"+
+				"  生成: %s\n"+
+				"重新生成: go run ./cmd/gercmd gen -force %s %s",
+				res.OutPath, line, a, b, filepath.ToSlash(modFile), filepath.ToSlash(outDir))
+		})
+	}
+}
+
+// normalizeEOL 统一行尾。仓库在 Windows 上按 autocrlf 检出是 CRLF，
+// 而生成器始终输出 LF，不归一化的话上面那条测试会跟着检出设置飘。
+func normalizeEOL(b []byte) string {
+	return strings.ReplaceAll(string(b), "\r\n", "\n")
+}
+
+// firstDiffLine 找出两份内容第一处不同的行。
+// 失败信息里贴两个完整文件没人会看，指出第一处差异才有用。
+func firstDiffLine(want, got string) (line int, wantLine, gotLine string) {
+	w, g := strings.Split(want, "\n"), strings.Split(got, "\n")
+	for i := 0; i < len(w) || i < len(g); i++ {
+		var x, y string
+		if i < len(w) {
+			x = w[i]
+		}
+		if i < len(g) {
+			y = g[i]
+		}
+		if x != y {
+			return i + 1, x, y
+		}
+	}
+	return 0, "", ""
 }

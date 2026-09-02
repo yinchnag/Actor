@@ -1,14 +1,17 @@
 // gercmd 是配合本仓库 actor 框架使用的命令行工具。
 //
-// 目前提供四个互相独立的子命令：
+// 目前提供五个互相独立的子命令：
 //
 //	dirs    列出路径下的文件夹
 //	files   列出路径下的文件
 //	cat     打印文件内容
 //	check   检查模块是否符合 GameSvr 的模块规范
+//	gen     为模块的公有方法生成 player 包的门面函数
+//
+// 用法与各命令的取舍见同目录的 README.md。
 //
 // 代码组织方式：每个子命令的实现和它的入口函数放在同一个文件里
-// （list.go / cat.go / check.go），共用的部分抽在 cli.go 与 walk.go。
+// （list.go / cat.go / check.go / gen.go），共用的部分抽在 cli.go 与 walk.go。
 // 加新功能 = 加一个文件 + 在下面的命令表里加一行，不动已有子命令。
 package main
 

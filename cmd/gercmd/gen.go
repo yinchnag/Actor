@@ -4,7 +4,6 @@ import (
 	"bytes"
 	_ "embed"
 	"fmt"
-	"go/ast"
 	"go/format"
 	"go/parser"
 	"go/token"
@@ -13,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"text/template"
+
+	gast "github.com/yinchnag/GCore/ast"
 )
 
 // 依据模块文件生成 player 包里的门面函数。
@@ -65,13 +66,12 @@ const defaultRecv = "PlayerEnt"
 
 // GenerateExports 读模块文件，为它的公有方法生成门面函数并写进 outDir。
 func GenerateExports(modFile, outDir string, opt GenOptions) (*GenResult, error) {
-	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, modFile, nil, parser.SkipObjectResolution|parser.ParseComments)
+	doc, err := gast.GetFileDoc(modFile)
 	if err != nil {
 		return nil, fmt.Errorf("解析 %s 失败: %w", modFile, err)
 	}
 
-	modType, err := findModuleType(f)
+	modType, err := findModuleType(doc)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", modFile, err)
 	}
@@ -102,32 +102,34 @@ func GenerateExports(modFile, outDir string, opt GenOptions) (*GenResult, error)
 
 	// 门面函数名的前缀：BagMod → Bag。用户写的 export: BagAddItem 就是这么来的。
 	prefix := strings.TrimSuffix(modType, "Mod")
-	r := newTypeRenderer(fileImports(f), outPkg)
+	r := newTypeRenderer(fileImports(doc.File), outPkg)
 
-	for _, d := range f.Decls {
-		fd, ok := d.(*ast.FuncDecl)
-		if !ok || receiverTypeName(fd) != modType || !ast.IsExported(fd.Name.Name) {
+	for i := range doc.Funcs {
+		method := doc.Funcs[i]
+		// FuncDoc.Recv 已剥掉指针与泛型实参，口径见 TestReceiverTypeName
+		if method.Recv != modType || !method.Exported || method.Decl == nil {
 			continue
 		}
-		where := pos(fset, fd.Pos())
-		names, _ := parseExportMarkers(fd.Doc)
+		where := posOf(method.Position())
+		// 标记的识别依赖注释的原始行结构，所以取原始 CommentGroup 而非 FuncDoc.Doc
+		names, _ := parseExportMarkers(method.Decl.Doc)
 
 		if !opt.All && len(names) == 0 {
 			res.Skipped = append(res.Skipped, SkippedMethod{
-				Name: fd.Name.Name, Where: where,
+				Name: method.Name, Where: where,
 				Reason: "没有 export: 标记（用 -all 可为所有公有方法生成）"})
 			continue
 		}
-		fnName := prefix + fd.Name.Name
+		fnName := prefix + method.Name
 		if len(names) > 0 {
 			fnName = names[0] // 标记里写了名字就以它为准
 		}
 
-		fn, err := buildFacadeFunc(fd, modType, fnName, r)
+		fn, err := buildFacadeFunc(method.Decl, modType, fnName, r)
 		if err != nil {
 			// 单个方法生成不了不影响其它方法，但原因必须说清
 			res.Skipped = append(res.Skipped, SkippedMethod{
-				Name: fd.Name.Name, Where: where, Reason: err.Error()})
+				Name: method.Name, Where: where, Reason: err.Error()})
 			continue
 		}
 		data.Funcs = append(data.Funcs, fn)
@@ -203,29 +205,20 @@ func renderFile(tmpl *template.Template, data FacadeFile) ([]byte, error) {
 }
 
 // findModuleType 找出文件里内嵌了 ModObj[*自己] 的那个 struct。
-func findModuleType(f *ast.File) (string, error) {
+func findModuleType(doc *gast.FileDoc) (string, error) {
 	var found []string
-	ast.Inspect(f, func(n ast.Node) bool {
-		ts, ok := n.(*ast.TypeSpec)
-		if !ok {
-			return true
-		}
-		st, ok := ts.Type.(*ast.StructType)
-		if !ok {
-			return true
-		}
-		for _, fld := range st.Fields.List {
-			if len(fld.Names) != 0 {
+	for _, sd := range doc.Structs {
+		for _, fld := range sd.Fields {
+			if !fld.Embedded {
 				continue // 具名字段不是内嵌
 			}
-			if _, arg, ok := modObjTypeArg(fld.Type); ok {
-				if exprString(arg) == "*"+ts.Name.Name {
-					found = append(found, ts.Name.Name)
+			if _, arg, ok := modObjTypeArg(fld.TypeExpr); ok {
+				if exprString(arg) == "*"+sd.Name {
+					found = append(found, sd.Name)
 				}
 			}
 		}
-		return true
-	})
+	}
 	switch len(found) {
 	case 0:
 		return "", fmt.Errorf("没找到内嵌 ModObj[*自己] 的模块类型")

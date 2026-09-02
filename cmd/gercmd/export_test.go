@@ -3,6 +3,8 @@ package main
 import (
 	"strings"
 	"testing"
+
+	gast "github.com/yinchnag/GCore/ast"
 )
 
 // exportSrc 是一份带各种 export: 写法的模块，用来把标记解析的边界钉死。
@@ -173,6 +175,65 @@ func (that *HeroMod) AddHero(id int) {}
 	for _, m := range res.Methods {
 		if m.Name == "AddHero" {
 			t.Fatal("HeroMod 的方法混进 BagMod 的列表了")
+		}
+	}
+}
+
+// TestReceiverTypeName 钉住接收者类型名的口径：指针、值、泛型接收者
+// 都归到裸类型名，普通函数为空。
+//
+// check.go 和 gen.go 都靠 fn.Recv == 模块类型名 把方法归属到模块，归错的后果是
+// 方法被静默漏掉——不报错，只是生成的门面里少了几个函数。这套口径原先由本包的
+// receiverTypeName 实现，换成 GCore 之后那个函数删掉了，这条测试接替它的保证。
+//
+// Gen2Mod 那两行是老实现的一个 bug：它只剥 IndexExpr，而多类型参数的接收者
+// Foo[T, U] 在 AST 里是 IndexListExpr，会返回空串把方法整个漏掉。
+// 换成 GCore 的 baseTypeName 之后顺带修好了，这里把修好的行为钉住。
+func TestReceiverTypeName(t *testing.T) {
+	src := `package bag
+
+type BagMod struct{}
+type GenMod[T any] struct{}
+type Gen2Mod[T any, U any] struct{}
+
+func (m *BagMod) PtrRecv()            {}
+func (m BagMod) ValRecv()             {}
+func (m *GenMod[T]) GenPtrRecv()      {}
+func (m GenMod[T]) GenValRecv()       {}
+func (m *Gen2Mod[T, U]) Gen2PtrRecv() {}
+func (m Gen2Mod[T, U]) Gen2ValRecv()  {}
+func PlainFunc()                      {}
+`
+	root := t.TempDir()
+	path := writeFileAt(t, root, "bag/recv.go", []byte(src))
+
+	doc, err := gast.GetFileDoc(path)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+
+	want := map[string]string{
+		"PtrRecv":     "BagMod",
+		"ValRecv":     "BagMod",
+		"GenPtrRecv":  "GenMod",
+		"GenValRecv":  "GenMod",
+		"Gen2PtrRecv": "Gen2Mod",
+		"Gen2ValRecv": "Gen2Mod",
+		"PlainFunc":   "",
+	}
+	// 数量也要对：FileDoc.Funcs 是声明视角、不含内嵌提升，
+	// 哪天它开始把提升上来的方法也塞进来，这里会先炸。
+	if len(doc.Funcs) != len(want) {
+		t.Fatalf("解析到 %d 个函数，期望 %d 个", len(doc.Funcs), len(want))
+	}
+	for _, fn := range doc.Funcs {
+		w, ok := want[fn.Name]
+		if !ok {
+			t.Errorf("冒出了没预期的函数 %s", fn.Name)
+			continue
+		}
+		if fn.Recv != w {
+			t.Errorf("%s 的接收者类型名 = %q, want %q", fn.Name, fn.Recv, w)
 		}
 	}
 }

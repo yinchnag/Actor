@@ -3,13 +3,14 @@ package main
 import (
 	"fmt"
 	"go/ast"
-	"go/parser"
 	"go/token"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"unicode"
+
+	gast "github.com/yinchnag/GCore/ast"
 )
 
 // 校验的是 GameSvr 的模块规范。一个合规的模块必须同时满足三条：
@@ -104,25 +105,22 @@ func CheckModule(root, input string, opt Options) (*ModuleCheck, error) {
 
 	// 复用 dirs/files 那套遍历：隐藏目录剪枝、读不动只跳过并告警，
 	// 三个子命令的行为因此天然一致，不会各走各的。
-	fset := token.NewFileSet()
 	var warns strings.Builder
 	err := walkTree(root, Options{Recursive: true, SkipHidden: opt.SkipHidden}, &warns,
 		func(e walkEntry) error {
 			if !e.D.Type().IsRegular() || !hasGoSuffix(e.D.Name()) {
 				return nil
 			}
-			// SkipObjectResolution：只看语法结构，不做标识符解析，快很多。
-			// ParseComments 必须显式加上——不加的话所有 Doc 都是 nil，
-			// 方法上的 export: 标记根本读不到。
-			f, perr := parser.ParseFile(fset, e.Path, nil,
-				parser.SkipObjectResolution|parser.ParseComments)
+			// GetFileDoc 内部带 ParseComments，方法上的 export: 标记能读到；
+			// 返回的各级 Doc 都带 Fset 与原始节点，位置和类型表达式后面还要用。
+			doc, perr := gast.GetFileDoc(e.Path)
 			if perr != nil {
 				// 单个文件语法错不该让整趟检查失败，但必须说出来——
 				// 否则"没找到"到底是真没有还是没解析成，用户分不清
 				res.Warns = append(res.Warns, fmt.Sprintf("解析 %s 失败: %v", e.Path, perr))
 				return nil
 			}
-			inspectFile(f, fset, res)
+			inspectDoc(doc, res)
 			return nil
 		})
 	if err != nil {
@@ -137,37 +135,65 @@ func CheckModule(root, input string, opt Options) (*ModuleCheck, error) {
 	return res, nil
 }
 
-func inspectFile(f *ast.File, fset *token.FileSet, res *ModuleCheck) {
-	ast.Inspect(f, func(n ast.Node) bool {
-		switch x := n.(type) {
-		case *ast.TypeSpec:
-			if x.Name.Name == res.TypeName {
-				checkStruct(x, fset, res)
-			}
-		case *ast.FuncDecl:
-			if x.Recv == nil {
-				// 构造函数必须是普通函数，不能是方法
-				if x.Name.Name == res.CtorName {
-					checkCtor(x, fset, res)
-				}
-				return true
-			}
-			// 挂在本模块类型上的方法，收集起来并读它的 export: 标记
-			if receiverTypeName(x) == res.TypeName {
-				collectMethod(x, fset, res)
-			}
+// inspectDoc 在一个文件的提炼结果里找目标模块的 struct、构造函数与方法。
+//
+// FileDoc 只收顶层声明，函数体内声明的类型不在其中——模块类型本来也必须是
+// 顶层的，收窄范围反而更贴合规范。
+func inspectDoc(doc *gast.FileDoc, res *ModuleCheck) {
+	for i := range doc.Structs {
+		if doc.Structs[i].Name == res.TypeName {
+			checkStruct(doc.Structs[i], res)
 		}
-		return true
-	})
+	}
+	// FileDoc.Structs 只装 struct，type BagMod int 这种落不进去。
+	// 但"名字占了却不是 struct"是条有用的诊断，单独扫一遍补上。
+	checkNonStructTypeSpec(doc, res)
+
+	for i := range doc.Funcs {
+		fn := doc.Funcs[i]
+		if fn.Recv == "" {
+			// 构造函数必须是普通函数，不能是方法
+			if fn.Name == res.CtorName {
+				checkCtor(fn, res)
+			}
+			continue
+		}
+		// 挂在本模块类型上的方法，收集起来并读它的 export: 标记。
+		// FuncDoc.Recv 已经剥掉了指针与泛型实参，口径见 TestReceiverTypeName。
+		if fn.Recv == res.TypeName {
+			collectMethod(fn, res)
+		}
+	}
 }
 
-func checkStruct(ts *ast.TypeSpec, fset *token.FileSet, res *ModuleCheck) {
-	where := pos(fset, ts.Pos())
-	st, ok := ts.Type.(*ast.StructType)
-	if !ok {
-		res.Struct.Detail = fmt.Sprintf("%s 存在但不是 struct（%s）", res.TypeName, where)
+// checkNonStructTypeSpec 处理"类型名存在但不是 struct"。
+// 这条只在还没找到合规 struct 时有意义，找到了就不必再提。
+func checkNonStructTypeSpec(doc *gast.FileDoc, res *ModuleCheck) {
+	if res.Struct.OK || doc.File == nil {
 		return
 	}
+	for _, decl := range doc.File.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			ts, ok := spec.(*ast.TypeSpec)
+			if !ok || ts.Name.Name != res.TypeName {
+				continue
+			}
+			if _, isStruct := ts.Type.(*ast.StructType); isStruct {
+				continue // 正常的 struct，上面已经处理过
+			}
+			res.Struct.Detail = fmt.Sprintf("%s 存在但不是 struct（%s）",
+				res.TypeName, posStr(doc.Fset, ts.Name.Pos()))
+			return
+		}
+	}
+}
+
+func checkStruct(sd gast.StructDoc, res *ModuleCheck) {
+	where := posOf(sd.Position())
 	if res.Struct.OK {
 		// 多个包各定义一个同名 struct：框架按类型名注册模块，
 		// 两个 BagMod 会抢同一个 key，AddModule 时后来的直接覆盖前面的
@@ -180,15 +206,15 @@ func checkStruct(ts *ast.TypeSpec, fset *token.FileSet, res *ModuleCheck) {
 
 	// 找内嵌的 ModObj
 	res.Embed.Detail = fmt.Sprintf("%s 没有内嵌 ModObj", res.TypeName)
-	for _, fld := range st.Fields.List {
-		if len(fld.Names) != 0 {
+	for _, fld := range sd.Fields {
+		if !fld.Embedded {
 			continue // 具名字段不是内嵌
 		}
-		qualifier, arg, ok := modObjTypeArg(fld.Type)
+		qualifier, arg, ok := modObjTypeArg(fld.TypeExpr)
 		if !ok {
 			continue
 		}
-		fldWhere := pos(fset, fld.Pos())
+		fldWhere := posOf(fld.Position())
 		want := "*" + res.TypeName
 		got := exprString(arg)
 		if got != want {
@@ -215,25 +241,31 @@ func checkStruct(ts *ast.TypeSpec, fset *token.FileSet, res *ModuleCheck) {
 // 只收公有方法：框架的反射注册只认公开方法，私有方法压根进不了调用表。
 // 但私有方法上如果带了标记，那是个必须点破的错误——写的人以为它对外了，
 // 实际上永远不会被调用到。
-func collectMethod(fd *ast.FuncDecl, fset *token.FileSet, res *ModuleCheck) {
-	where := pos(fset, fd.Pos())
-	names, typos := parseExportMarkers(fd.Doc)
+func collectMethod(fn gast.FuncDoc, res *ModuleCheck) {
+	where := posOf(fn.Position())
+	// 用原始 CommentGroup 而不是 FuncDoc.Doc：标记的识别依赖注释的原始行结构，
+	// 提炼过的文本已经 TrimSpace，缩进信息没了。
+	var doc *ast.CommentGroup
+	if fn.Decl != nil {
+		doc = fn.Decl.Doc
+	}
+	names, typos := parseExportMarkers(doc)
 
 	for _, t := range typos {
 		res.Warns = append(res.Warns, fmt.Sprintf(
 			"%s 的注释 %q 像是写错大小写的 export: 标记，当前不会生效", where, t))
 	}
 
-	if !ast.IsExported(fd.Name.Name) {
+	if !fn.Exported {
 		if len(names) > 0 {
 			res.Warns = append(res.Warns, fmt.Sprintf(
 				"%s 的 %s 是私有方法却带了 export: 标记——框架只反射公有方法，它永远不会被调用到",
-				where, fd.Name.Name))
+				where, fn.Name))
 		}
 		return
 	}
 
-	m := ModuleMethod{Name: fd.Name.Name, Where: where}
+	m := ModuleMethod{Name: fn.Name, Where: where}
 	if len(names) > 0 {
 		m.Exported = true
 		m.ExportName = names[0]
@@ -255,19 +287,20 @@ func collectMethod(fd *ast.FuncDecl, fset *token.FileSet, res *ModuleCheck) {
 	res.Methods = append(res.Methods, m)
 }
 
-func checkCtor(fd *ast.FuncDecl, fset *token.FileSet, res *ModuleCheck) {
-	where := pos(fset, fd.Pos())
+func checkCtor(fn gast.FuncDoc, res *ModuleCheck) {
+	where := posOf(fn.Position())
 	if res.Ctor.OK {
 		return // 已经找到合规的了
 	}
 	res.Ctor.Where = where
 
-	n := resultCount(fd.Type.Results)
+	// Results 已按名字展开，(a, b int) 会是两项，直接数长度即可
+	n := len(fn.Results)
 	if n != 1 {
 		res.Ctor.Detail = fmt.Sprintf("%s 有 %d 个返回值，规范要求恰好一个 actor.IModule", res.CtorName, n)
 		return
 	}
-	ret := fd.Type.Results.List[0].Type
+	ret := fn.Results[0].TypeExpr
 	qualifier, ok := iModuleQualifier(ret)
 	if !ok {
 		res.Ctor.Detail = fmt.Sprintf("%s 返回 %s，规范要求 actor.IModule",
@@ -328,23 +361,6 @@ func modObjTypeArg(e ast.Expr) (qualifier string, arg ast.Expr, ok bool) {
 	return qualifier, ix.Index, true
 }
 
-// resultCount 数真实的返回值个数。
-// func f() (a, b int) 在 AST 里是一个 Field 带两个 Name，不能只数 Field。
-func resultCount(fl *ast.FieldList) int {
-	if fl == nil {
-		return 0
-	}
-	n := 0
-	for _, f := range fl.List {
-		if len(f.Names) == 0 {
-			n++
-		} else {
-			n += len(f.Names)
-		}
-	}
-	return n
-}
-
 // exprString 把类型表达式还原成源码写法，用于错误信息与比对。
 // 只覆盖类型里会出现的几种节点，够用即可。
 func exprString(e ast.Expr) string {
@@ -366,9 +382,16 @@ func exprString(e ast.Expr) string {
 	}
 }
 
-func pos(fset *token.FileSet, p token.Pos) string {
-	pp := fset.Position(p)
-	return fmt.Sprintf("%s:%d", filepath.ToSlash(pp.Filename), pp.Line)
+// posOf 把位置格式化成 file:line。列号对读的人没用，报出来反而更长。
+func posOf(p token.Position) string {
+	return fmt.Sprintf("%s:%d", filepath.ToSlash(p.Filename), p.Line)
+}
+
+func posStr(fset *token.FileSet, p token.Pos) string {
+	if fset == nil {
+		return ""
+	}
+	return posOf(fset.Position(p))
 }
 
 // runCheck 是 check 子命令的入口。

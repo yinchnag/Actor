@@ -160,6 +160,89 @@ func TestCheckMissingStruct(t *testing.T) {
 	}
 }
 
+// TestCheckNonStructType 类型名被非 struct 占用。
+//
+// FileDoc.Structs 只装 struct，type BagMod int 这种压根落不进去，所以这条诊断
+// 走的是 checkNonStructTypeSpec 单独扫的那一遍。少了它，用户看到的会是
+// "没找到 BagMod"——把人往"我是不是文件放错地方了"的方向带，方向完全指错。
+func TestCheckNonStructType(t *testing.T) {
+	src := `package bag
+
+import "actor"
+
+type BagMod int
+
+func NewBagMod() actor.IModule { return nil }
+`
+	res := mustCheck(t, fixture(t, "bag", "bag_mod.go", src), "bag")
+	if res.Struct.OK {
+		t.Fatal("BagMod 不是 struct，这一项不该通过")
+	}
+	if !strings.Contains(res.Struct.Detail, "不是 struct") {
+		t.Fatalf("应当点明它存在但不是 struct，实际: %q", res.Struct.Detail)
+	}
+	// 位置是这条诊断的全部价值：不带位置就等于只说了句"有问题"
+	if !strings.Contains(res.Struct.Detail, "bag_mod.go:5") {
+		t.Fatalf("诊断里要带上声明位置，实际: %q", res.Struct.Detail)
+	}
+}
+
+// TestCheckNonStructAlias 类型别名同样要认出来。
+// type BagMod = X 在 AST 里也是 TypeSpec，只是 Assign 位有效，
+// 一样走不进 FileDoc.Structs。
+func TestCheckNonStructAlias(t *testing.T) {
+	src := `package bag
+
+type BagMod = map[string]int
+`
+	res := mustCheck(t, fixture(t, "bag", "bag_mod.go", src), "bag")
+	if res.Struct.OK {
+		t.Fatal("别名不是 struct，这一项不该通过")
+	}
+	if !strings.Contains(res.Struct.Detail, "不是 struct") {
+		t.Fatalf("别名也该报存在但不是 struct，实际: %q", res.Struct.Detail)
+	}
+}
+
+// TestCheckNonStructIgnoredWhenStructFound 合规 struct 在场时，
+// 别处同名的非 struct 声明不该影响结论。
+//
+// checkNonStructTypeSpec 带了 if res.Struct.OK { return } 的守卫，而 CheckModule
+// 是按文件遍历顺序累积结果的——守卫只在"合规的先被遍历到"时起作用，反过来则靠
+// checkStruct 里的 Detail 清空兜底。两条路都得走一遍：只测一种顺序的话，
+// 少了其中任何一半都照样能过。
+func TestCheckNonStructIgnoredWhenStructFound(t *testing.T) {
+	// 目录名决定 WalkDir 的先后，a_ 开头的先被遍历到
+	for _, tc := range []struct {
+		name    string
+		goodDir string
+		badDir  string
+	}{
+		{"非 struct 先被遍历到", "b_good", "a_bad"},
+		{"合规 struct 先被遍历到", "a_good", "b_bad"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			good := strings.Replace(goodSrc, "package bag", "package "+tc.goodDir, 1)
+			writeFileAt(t, root, tc.goodDir+"/bag_mod.go", []byte(good))
+			bad := "package " + tc.badDir + `
+
+type BagMod int
+`
+			writeFileAt(t, root, tc.badDir+"/other.go", []byte(bad))
+
+			res := mustCheck(t, root, "bag")
+			if !res.AllOK() {
+				t.Fatalf("合规 struct 在场就该三项全过: struct=%+v embed=%+v ctor=%+v",
+					res.Struct, res.Embed, res.Ctor)
+			}
+			if res.Struct.Detail != "" {
+				t.Fatalf("通过的检查项不该留下否定说明: %q", res.Struct.Detail)
+			}
+		})
+	}
+}
+
 // TestCheckBareModObj 同包内直接写 ModObj[*X] 而不带包名，也应当认得。
 // 框架自己的测试模块就是这么写的。
 func TestCheckBareModObj(t *testing.T) {
