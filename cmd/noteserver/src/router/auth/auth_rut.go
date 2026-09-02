@@ -20,10 +20,10 @@ import (
 
 // Auth 持有路由需要的依赖。
 //
-// 内嵌 web.Router[*Auth] 之后，下面两个公有方法会被 Init 反射扫出来
+// 内嵌 web.Router[*AuthRut] 之后，下面两个公有方法会被 Init 反射扫出来
 // 并自动挂到 gin 上；类型参数必须写成自己，写错了 Init 会当场 panic。
-type Auth struct {
-	web.Router[*Auth]
+type AuthRut struct {
+	web.Router[*AuthRut]
 	hub service
 }
 
@@ -35,23 +35,24 @@ type Auth struct {
 // "AuthMod"/"Register" 这类字符串——改了模块方法名，这里编译就红。
 type service interface {
 	AuthRegister(gid uint64, uid string, passwordHash string) (string, error)
-	AuthLookup(gid uint64, uid string) (contract.AccountInfo, error)
+	AuthLookup(gid uint64, uid string) (comm.AccountSnap, error)
 	AuthTouchLogin(gid uint64, uid string, at time.Time)
 	Sessions() contract.ISessionStore
+	LoadUser(uid string)
 }
 
 // New 建路由并把接口挂到 group 上。
 //
 // 挂哪几条、什么方法、什么路径，全部由下面的方法签名和请求类型决定，
 // 这里不再逐条 group.POST。加一个接口 = 加一个方法 + 一个请求类型。
-func New(group gin.IRoutes, hub service) *Auth {
-	a := &Auth{hub: hub}
+func New(group gin.IRoutes, hub service) *AuthRut {
+	a := &AuthRut{hub: hub}
 	a.Init(group, bases.RouterOpts()...)
 	return a
 }
 
 // Register 注册。→ POST /register
-func (that *Auth) Register(req *RegisterRequest, ctx *gin.Context) {
+func (that *AuthRut) Register(req *RegisterRequest, ctx *gin.Context) {
 	if !security.ValidPhone(req.Phone) {
 		bases.Fail(ctx, http.StatusBadRequest, "手机号格式不正确")
 		return
@@ -86,7 +87,7 @@ func (that *Auth) Register(req *RegisterRequest, ctx *gin.Context) {
 }
 
 // Login 登录。→ POST /login
-func (that *Auth) Login(req *LoginRequest, ctx *gin.Context) {
+func (that *AuthRut) Login(req *LoginRequest, ctx *gin.Context) {
 	if req.Phone == "" || req.Password == "" {
 		bases.Fail(ctx, http.StatusBadRequest, "手机号和密码不能为空")
 		return
@@ -124,6 +125,11 @@ func (that *Auth) Login(req *LoginRequest, ctx *gin.Context) {
 		bases.Fail(ctx, http.StatusServiceUnavailable, "会话服务暂时不可用")
 		return
 	}
+
+	// 规范第 7 条：用户登入成功之后给他挂上 **_mod.go 的模块。
+	// 于是他的第一个业务请求不必再付创建 actor 的钱；一直不用的话，
+	// 空闲回收照样会把它收走，登录本身不会永久占一条协程。
+	that.hub.LoadUser(acc.UID)
 
 	// 记录登录时间：无返回值 = 投递即忘，登录应答不等它落库。
 	// 失败会走 Hub 装的 DiscardedErrorHandler，不会静默消失。

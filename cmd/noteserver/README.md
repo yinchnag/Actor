@@ -29,30 +29,189 @@ go run . -data /path/to/data          # 或指定配置目录
 SERVER_PORT=18080 go run .
 ```
 
-## 目录结构
+## 项目规范
+
+这一节是**约束**，不是建议。新加代码前先看它；`layering_test.go` 会把其中的依赖
+规则和文件命名规则当测试跑，违反了直接红。
+
+### 目录与依赖
 
 ```
 main.go              只做装配：读配置 → 起连接池 → 建 Hub → 挂路由 → Run
 data/                两份配置
-src/
-  bases/             全局 gin 引擎、应答格式、actor 错误 → HTTP 语义、web.Router 的选项
-  comm/              跨层共享常量（会话有效期、笔记上限、分片数…）
-  config/            服务器自身配置
-  contract/          接口与错误哨兵，不放实现
-  databases/         Norm 表结构 + contract 的生产实现
-  middleware/        Bearer 鉴权
-  mods/              actor 模块：AuthMod、NoteMod（门面由 export: 标记生成）
-  router/            按业务分包，每包一个 xxx.go + xxx_type.go
-    auth/ note/ health/
-  security/          bcrypt、令牌、手机号与密码校验
-  service/           Hub：actor 的创建与回收 + 生成的门面（*_export.go）
 templates/           门面的生成模板
+src/
+  comm/              全项目可用的数据源：常量 + **Snap 值类型（文件一律 **_comm.go）
+  contract/          只有接口，以及它们返回的错误哨兵
+  databases/         需要存档的对象
+  middleware/        gin 中间件
+  mods/              逻辑模块，按功能分文件夹
+    auth/  note/
+  router/            路由，按功能分文件夹
+    auth/  note/  health/
+  service/           最上层终端：Hub + 生成的门面（**_export.go）
+  ── 以下三个是规范七个文件夹之外的补充（见第 8 条），同样受依赖约束管 ──
+  bases/             HTTP 基座：gin 引擎、应答格式、actor 错误 → HTTP 语义
+  security/          bcrypt、令牌、手机号与密码校验
+  config/            服务器自身配置
 ```
 
-与参考项目 `roleSvr` 的一点不同：**存储藏在 `contract` 的接口后面**。`roleSvr` 的
-service 直接调 databases，那是业务服务器的写法；这里多一层接口，是为了让整套 actor
-编排能在**没有 MySQL/Redis** 的机器上被完整测到（见下面"测试"一节）。示例跑不起
-测试就失去了示例的意义。
+依赖只能自上而下。**这张表就是 `layering_test.go` 里的那张表**，改代码要连它一起改：
+
+| 包 | 允许引入的内部包 |
+|---|---|
+| `comm` | **无** —— 依赖图的底层 |
+| `contract` | `comm` |
+| `databases` | `comm` `contract` |
+| `bases` / `security` | `comm` |
+| `config` | 无 |
+| `middleware` | `bases` `comm` `contract` |
+| `mods/*` | `comm` `contract` —— **绝不能引 service** |
+| `router/*` | `bases` `comm` `contract` `security` `middleware` |
+| `service` | 全部 |
+
+### 文件命名总表
+
+| 位置 | 文件名 | 里面定义什么 |
+|---|---|---|
+| `comm/` | `**_comm.go` | `**Snap` 值类型、常量。**本包所有文件都要这个后缀** |
+| `mods/<功能>/` | `**_mod.go` | `**Mod` —— 挂在用户身上，组合 `actor.ModObj` |
+| `mods/<功能>/` | `**_mgr.go` | `**Mgr` —— 挂在服务器上，组合 `actor.ModObj` |
+| `mods/<功能>/` | `**_imp.go` | `**Imp` —— 细分逻辑，**不**组合 `ModObj`，由 Mod/Mgr 持有 |
+| `mods/<功能>/` | `**_type.go` | 模块私有的数据类型 |
+| `router/<功能>/` | `**_rut.go` | `**Rut` —— 组合 `web.Router` |
+| `router/<功能>/` | `**_type.go` | `**Request` / `**Response` |
+| `service/` | `**_export.go` | **生成物，严禁手改**；名字 = 模块文件名剥掉 `_mod`/`_mgr` 加 `_export` |
+
+一个功能文件夹**有且只有一个** `**_mod.go` 或 `**_mgr.go`（`TestModFileNaming` 会拦）；
+每个路由文件夹**至少一个** `**_rut.go`（`TestRouterFileNaming` 会拦）。
+
+### 1. comm —— 全项目的数据源
+
+**文件一律 `**_comm.go`**，常量文件也不例外（`consts_comm.go`）。
+
+内容上：常量**标识符**无命名要求；struct **必须以 Snap 结尾**。注意这两件事别混——
+"无命名要求"说的是常量叫什么名字随意，不是说文件名可以随意。
+
+Snap 是个标记，含义是"这个值可以跨模块传递"。反过来说，不带 Snap 的类型就不该
+出现在模块与模块之间——那类型属于某个模块自己，别人不该认识它。**AMod 需要
+BMod 的数据时，BMod 只能返回 `**Snap`。**
+
+**本包不引入任何其他内部包。** 一旦它开始 import contract 或 mods，分层就塌了。
+
+### 2. contract —— 只有接口
+
+只放接口，以及与接口直接相关的东西（这里是它们返回的错误哨兵）。**不放普通对象**
+——跨模块传的值一律去 comm 定义成 `**Snap`。只能引入 `comm`。
+
+### 3. databases —— 需要存档的对象
+
+所有需要存档的对象定义在这里，**不论它最终存到哪**（本项目里 account/note 落
+MySQL+Redis，session 只落 Redis，都在这个文件夹）。只能引入 `comm` 和 `contract`。
+
+### 4. middleware —— 中间件
+
+gin 中间件放这里。
+
+### 5. mods —— 逻辑模块
+
+**按功能分文件夹**，一个功能一个文件夹（`mods/auth/`、`mods/note/`）。
+
+**一个功能文件夹有且只有一个入口文件**，命名二选一：
+
+| 后缀 | 含义 | 判断标准 | 谁加载 |
+|---|---|---|---|
+| `**_mod.go` → `**Mod` | 挂在**用户**身上 | 没有用户时这个功能没事可做 | 用户登入成功后 |
+| `**_mgr.go` → `**Mgr` | 挂在**服务器**上 | 没有用户时也需要正常运行 | 服务器启动时 |
+
+登入验证、邮件都属于后者——用户还没登进来，谁给他挂模块？本项目里 `auth` 是
+`AuthMgr`，`note` 是 `NoteMod`。
+
+入口类型必须组合 `actor.ModObj[*自己]`，构造函数返回 `actor.IModule`
+（不返回具体类型，是为了不给调用方"绕过 actor 直接调方法"的机会）。
+
+**功能复杂时用 `**_imp.go` 细分**：在同一个文件夹里定义 `**Imp` 对象，由 `**Mod` /
+`**Mgr` 持有。`**Imp` **不再组合 `actor.ModObj`**——跨 goroutine 的入口只该有一个。
+再开一个 `_mod.go` 是不允许的，`TestModFileNaming` 会拦。
+
+**独属于本模块的数据类型放 `**_type.go`。** 一旦发现别的模块也要用它，就去 comm
+建 `**_comm.go` 定义 `**Snap`，对外一律用 Snap 顶替。本项目两个模块都没有
+`**_type.go`：它们的数据形状和 `comm.NoteSnap` / `comm.AccountSnap` 完全一致，
+再造一个模块私有类型只是抄字段。
+
+### 6. router —— 路由
+
+**按功能分文件夹**，每个文件夹至少一个 `**_rut.go`，其中定义 `**Rut` 对象并组合
+`web.Router[*自己]`（`TestRouterFileNaming` 会拦缺失）。
+
+请求与响应类型单独放 `**_type.go`，命名 `**Request` / `**Response`。请求类型内嵌
+`web.POST` 等标记声明 HTTP 动词，可选 `path` tag 覆盖路径：
+
+```go
+// note_type.go
+type UploadRequest struct {
+    web.POST `path:"/notes"`
+    Content  string `json:"content"`
+}
+
+// note_rut.go
+type NoteRut struct {
+    web.Router[*NoteRut]
+    hub service
+}
+func (that *NoteRut) Upload(req *UploadRequest, ctx *gin.Context) { ... }
+```
+
+### 7. service —— 最上层终端
+
+可以引入所有包。至少有一个 `Hub`：启动时加载 `**_mgr.go` 的模块，用户登入成功后
+给他加载 `**_mod.go` 的模块。
+
+`**_export.go` 是**框架生成的，严禁手改**——改了下次 `go generate` 就没了，
+`TestFacadesUpToDate` 也会红。要改行为去改模块方法上的 `export:` 标记。
+
+文件名由模块文件名推出：**剥掉末尾的 `_mod` / `_mgr`，再加 `_export`**。
+
+```
+mods/auth/auth_mgr.go  →  service/auth_export.go
+mods/note/note_mod.go  →  service/note_export.go
+```
+
+生成物里不带 mod/mgr 是有意的：那个后缀描述的是"模块挂在谁身上"，而门面没有这个
+区别——它们都是挂在 Hub 上的普通方法。文件名里留着只会让人以为那是两类东西。
+
+**但不是每个模块都会有生成物。** 一个模块完全可以只有内部方法、一个 `export:`
+标记都不带，那时它不产生任何 `**_export.go`，这是**合法设计**而不是遗漏：
+
+```
+mods/xxx/xxx_mod.go  有 export: 标记  →  service/xxx_export.go
+mods/yyy/yyy_mod.go  没有任何标记      →  不产生文件（合法）
+```
+
+`gercmd verify` 把这种情况单独报成 `noexport` 并放行，`-strict` 也不升级它 ——
+`-strict` 只针对"漏写了 `//go:generate` 指令"。反过来，**标记删了而生成物没删**
+会被报成 `leftover` 失败：那份残留仍在参与编译、仍对外暴露着一个已经不该导出的
+方法。删标记时记得把生成物一起删掉，或者直接跑一次 `go generate` 让它自己消失。
+
+**mod 与 mgr 之间不可以直接调用公有函数，必须走 `**_export.go` 里的导出函数。**
+理由是不能假定两个模块处于同一条协程——直接调就是在别人的事件循环之外改他的状态，
+actor 的全部保证瞬间失效。
+
+> 做法上有个坑：`mods` **不能 import `service`**（会与 `service → mods` 成环，
+> 分层测试也会拦）。所以模块要调别人时，在自己包里声明一个只含所需方法的小接口，
+> 由 Hub 满足它、在构造时注入。本项目暂时没有跨模块调用，真要加时按这个来。
+
+### 8. 别的文件夹
+
+不建议再建新文件夹，但不拦着。真建了就在 `layering_test.go` 的表里登记它的依赖
+约束——否则那个测试会因为"包不在分层表里"直接红。`bases` / `security` / `config`
+就是这么来的。
+
+### 与参考项目 roleSvr 的一点不同
+
+**存储藏在 `contract` 的接口后面。** `roleSvr` 的 service 直接调 databases，那是业务
+服务器的写法；这里多一层接口，是为了让整套 actor 编排能在**没有 MySQL/Redis** 的
+机器上被完整测到（见"测试"一节）。示例跑不起测试就失去了示例的意义。
 
 ## 自动注册路由
 
@@ -161,32 +320,35 @@ GET 路由，那种错误要等线上打不通接口才发现。这里参数个�
 
 ## 模块与生成的门面
 
-actor 模块放在 `src/mods/`，遵循仓库的模块规范 —— `gercmd check` 能验：
+actor 模块放在 `src/mods/<功能>/`，遵循仓库的模块规范：struct 内嵌
+`actor.ModObj[*自己]`；构造函数返回 `actor.IModule`；要对外暴露的方法带
+`export:` 标记。`gercmd check` 能验：
 
 ```bash
-go -C ../.. run ./cmd/gercmd check auth cmd/noteserver/src   # 3/3 通过
-go -C ../.. run ./cmd/gercmd check note cmd/noteserver/src
+go -C ../.. run ./cmd/gercmd check auth cmd/noteserver/src   # 找到 AuthMgr，3/3 通过
+go -C ../.. run ./cmd/gercmd check note cmd/noteserver/src   # 找到 NoteMod，3/3 通过
 ```
 
-规范三条：struct 内嵌 `actor.ModObj[*自己]`；构造函数返回 `actor.IModule`；
-要对外暴露的方法带 `export:` 标记。
+`check auth` 分不清你指 `AuthMod` 还是 `AuthMgr`——名字里没这个信息，所以它把候选
+都试一遍，哪个的 struct 真存在就检查哪个。约定不同的项目可以用 `-type-suffix` /
+`-ctor-prefix` 改，gercmd 不写死这些。
 
 路由**不直接调 `ModInvoke`**。方法上的标记会被生成成 `Hub` 上的门面：
 
 ```go
 //	export: NoteAdd
-func (that *NoteMod) Add(content string) (contract.NoteInfo, error)
+func (that *NoteMod) Add(content string) (comm.NoteSnap, error)
 ```
 
 ↓ `go generate ./src/mods/`
 
 ```go
 // src/service/note_export.go — Code generated; DO NOT EDIT.
-func (that *Hub) NoteAdd(gid uint64, uid string, content string) (contract.NoteInfo, error) {
+func (that *Hub) NoteAdd(gid uint64, uid string, content string) (comm.NoteSnap, error) {
 	loader := that.AcquireUser(uid)
 	defer that.ReleaseUser(uid)
 	out, err := loader.ModInvokeFrom(gid, "NoteMod", "Add", content)
-	return unwrap[contract.NoteInfo](out, err, "NoteMod.Add")
+	return unwrap[comm.NoteSnap](out, err, "NoteMod.Add")
 }
 ```
 
@@ -196,32 +358,51 @@ func (that *Hub) NoteAdd(gid uint64, uid string, content string) (contract.NoteI
 ### 为什么要自己写模板
 
 `gercmd` 的内置模板是为 GameSvr 那种布局写的（宿主唯一、`that.GetModloader()`、
-错误 `println` 掉）。noteserver 三处对不上，所以 `templates/` 下自带两份：
+错误 `println` 掉）。noteserver 三处对不上，所以 `templates/` 下自带两份。
 
-| 模板 | 用于 | 关键差别 |
+**选哪个，取决于"这个模块的 actor 怎么找到"，而不是模块叫什么名字。**
+
+| 模板 | 什么时候用 | 门面里长什么样 |
 |---|---|---|
-| `shard_export.tmpl` | AuthMod | loader 按手机号分片取：`that.AuthFor(uid)` |
-| `user_export.tmpl` | NoteMod | `AcquireUser` / `defer ReleaseUser` 收进门面 |
+| `user_export.tmpl` | **每用户一个 actor** 的模块，也就是所有 `**_mod.go` | 多一个 `uid` 参数用来选 actor；`AcquireUser` + `defer ReleaseUser` 由模板负责 |
+| `shard_export.tmpl` | 挂在**按业务键分片**的 actor 上的模块 | loader 用 `that.AuthFor(uid)` 取，uid 就是模块方法的第一个参数 |
 
-第二条是这次改造最实在的收获：取用与归还原先写在每个 handler 里，靠人记得写
-`defer`。**漏一次 Release，那个 actor 的 inFlight 永远回不到 0，从此再不被回收**，
-一个用户漏一条协程。现在它在生成的代码里，想漏也漏不掉。
+`**_mod.go` 一定走 `user_export.tmpl` —— 每用户 actor 的取用/归还是硬性的。
+`**_mgr.go` 则要看 Hub 怎么持有它：本项目的 `AuthMgr` 是按手机号分片的，所以走
+`shard_export.tmpl`；**如果以后加一个单例 Mgr**（比如全局只有一个的邮件模块），
+那两份模板都不合适——`AuthFor(uid)` 拿不到它——需要再写一份取 loader 的方式不同的
+模板。模板的差别只在"怎么拿到 loader"这一行，照着现有的改很快。
+
+对应关系写在各自模块的 `//go:generate` 里，那也是 `gercmd verify` 读的地方：
+
+```go
+// mods/auth/auth_mgr.go
+//go:generate ... gen -tmpl cmd/noteserver/templates/shard_export.tmpl -recv Hub ...
+
+// mods/note/note_mod.go
+//go:generate ... gen -tmpl cmd/noteserver/templates/user_export.tmpl -recv Hub ...
+```
+
+`user_export.tmpl` 把取用与归还收进门面，是这次改造最实在的收获：它们原先写在每个
+handler 里，靠人记得写 `defer`。**漏一次 Release，那个 actor 的 inFlight 永远回不到
+0，从此再不被回收**，一个用户漏一条协程且不报错。现在它在生成的代码里，想漏也漏不掉。
 
 两份模板都把错误**返回**而不是 `println` 掉 —— 内置模板那种写法会让存储故障变成
 "成功返回空结果"，HTTP 层再没机会翻译成 5xx。
 
 ### 两条对模块方法的约束
 
-**参数和返回值不能用 `mods` 包自己声明的类型。** 门面生成在 `service` 包，
-gercmd 一律拒绝引用模块包的类型（GameSvr 那种布局下会成环）。跨层值类型统一放
-`contract`。这条约束顺带把签名逼简单了 —— 原先那一堆 `XxxArgs`/`XxxResult`
-包装类型只是为了迁就 `ModInvoke` 的 `any`，去掉之后签名反而更好读。
+**参数和返回值不能用模块包自己声明的类型。** 门面生成在 `service` 包，gercmd
+一律拒绝引用模块包的类型（GameSvr 那种布局下会成环）。这与规范第 1 条是同一件事
+的两个说法：跨模块只传 `comm` 里的 `**Snap`。这条约束顺带把签名逼简单了 ——
+原先那一堆 `XxxArgs`/`XxxResult` 包装类型只是为了迁就 `ModInvoke` 的 `any`，
+去掉之后签名反而更好读。
 
 **要么没有返回值（投递即忘），要么正好是 `(T, error)`。** 违反会让模板生成非法
 Go 代码、`gen` 当场失败 —— 这是有意的，早失败好过生成一个悄悄错的门面。
 
-`TestGeneratedFacadesUpToDate` 会把生成器再跑一遍跟磁盘上的文件比，
-挡住"改了模块签名忘了重新生成"。
+`TestFacadesUpToDate` 调 `gercmd verify -strict` 挡住"改了模块忘了重新生成"，
+详见"测试"一节。
 
 ## 接口
 
@@ -263,7 +444,7 @@ Go 代码、`gen` 当场失败 —— 这是有意的，早失败好过生成一
 **别在无返回值的模块方法里 panic。** 框架 `handleTask` 的 recover 在上报
 `PhaseInvoke` 之后会顺手 `Close()` 掉整个 actor。为一次记录登录时间的失败
 干掉一整个分片，代价完全不成比例——那类错误在模块内部自己落日志消化掉
-（见 `AuthMod.TouchLogin`）。
+（见 `AuthMgr.TouchLogin`）。
 
 ### 超时语义直接映射到 HTTP
 
@@ -350,7 +531,25 @@ go test -race ./... -count=1
 
 被测的是真正跑在线上的那套路由和编排——只有 `contract` 的三个实现被换掉了。
 
-`generate_test.go` 挡住生成的门面与模块签名漂移。
+`layering_test.go` 把上面"项目规范"里的依赖表与命名规则跑成断言：包引了不该引的
+东西、功能文件夹里出现第二个 `**_mod.go`、路由文件夹缺 `**_rut.go`、comm 下的文件
+少了 `_comm` 后缀、comm 里导出的 struct 没以 `Snap` 结尾，都会红。
+新建包时要同时在它的表里登记依赖约束，否则"包不在分层表里"也会红。
+
+`generate_test.go` 挡住生成的门面与模块漂移，做法是调 `gercmd verify -strict`：
+
+```bash
+go -C ../.. run ./cmd/gercmd verify -strict cmd/noteserver/src
+```
+
+它**自己**递归找 `**_mod.go` / `**_mgr.go`、自己读它们 `//go:generate` 里的参数、
+自己重新生成比对，还会反过来报告没有模块对应的多余 `**_export.go`。这里刻意不在
+测试里列清单——那张清单本身就是新的人为出错点：加了模块忘了登记，检查就默默漏掉
+它。**检查工具自己需要人来维护，等于没有检查。**
+
+`-strict` 拦的是"**漏写了 `//go:generate` 指令**"——本项目要求每个模块都能被校验。
+它**不会**因为某个模块没有 `export:` 标记就报错：那是合法设计（见规范第 7 条），
+所以加一个纯内部模块不会让这条测试变红。
 自动路由本身的单测与基准跟着代码搬到了 `web/` 模块（`cd ../../web && go test ./...`）。
 `src/databases/quote_test.go` 单测那个 SQL 白名单，`src/security/password_test.go`
 单测手机号与密码规则。这几个包都不需要任何外部依赖。

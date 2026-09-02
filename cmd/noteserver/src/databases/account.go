@@ -14,6 +14,7 @@ import (
 	"errors"
 	"time"
 
+	"noteserver/src/comm"
 	"noteserver/src/contract"
 
 	"github.com/norm/orm"
@@ -32,8 +33,8 @@ type Account struct {
 	LoginDate    int64  `orm:"name:login_date,comment:最近登录时间（毫秒时间戳）"`
 }
 
-func (that *Account) snapshot() contract.AccountInfo {
-	return contract.AccountInfo{
+func (that *Account) snapshot() comm.AccountSnap {
+	return comm.AccountSnap{
 		UID:          that.UID,
 		PasswordHash: that.PasswordHash,
 		RegisterDate: that.RegisterDate,
@@ -55,14 +56,14 @@ func NewAccountStore() *AccountStore {
 }
 
 // Find 按 UID 取账号。Redis 命中就不查 MySQL。
-func (that *AccountStore) Find(uid string) (contract.AccountInfo, error) {
+func (that *AccountStore) Find(uid string) (comm.AccountSnap, error) {
 	acc := &Account{UID: uid}
 	acc.Init()
 	if err := acc.Load(); err != nil {
 		if orm.IsNotFound(err) {
-			return contract.AccountInfo{}, contract.ErrAccountNotFound
+			return comm.AccountSnap{}, contract.ErrAccountNotFound
 		}
-		return contract.AccountInfo{}, err
+		return comm.AccountSnap{}, err
 	}
 	return acc.snapshot(), nil
 }
@@ -79,14 +80,14 @@ func (that *AccountStore) Find(uid string) (contract.AccountInfo, error) {
 // 但窗口被 Redis 收窄了——Save 写 Redis 是同步的，而所有实例共用同一个 Redis，
 // 所以 A 的 Save 返回之后 B 的 Find 就一定看得见。剩下的只有
 // "B 查完但 A 还没写完"这一小段。示例项目按单实例部署，这一点如实记在 README 里。
-func (that *AccountStore) Create(uid, passwordHash string) (contract.AccountInfo, error) {
+func (that *AccountStore) Create(uid, passwordHash string) (comm.AccountSnap, error) {
 	switch _, err := that.Find(uid); {
 	case err == nil:
-		return contract.AccountInfo{}, contract.ErrPhoneTaken
+		return comm.AccountSnap{}, contract.ErrPhoneTaken
 	case errors.Is(err, contract.ErrAccountNotFound):
 		// 正常路径，继续建号
 	default:
-		return contract.AccountInfo{}, err
+		return comm.AccountSnap{}, err
 	}
 
 	now := time.Now().UnixMilli()

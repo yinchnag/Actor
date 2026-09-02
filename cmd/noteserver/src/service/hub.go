@@ -14,7 +14,8 @@ import (
 
 	"noteserver/src/comm"
 	"noteserver/src/contract"
-	"noteserver/src/mods"
+	"noteserver/src/mods/auth"
+	"noteserver/src/mods/note"
 
 	"actor"
 )
@@ -69,10 +70,12 @@ func NewHub(deps Deps) *Hub {
 		janitorDone: make(chan struct{}),
 	}
 
+	// 规范第 7 条：**_mgr.go 的模块在启动时加载。
+	// AuthMgr 是 Mgr 不是 Mod，因为登入验证在用户登进来之前就得能跑。
 	for i := range h.auth {
 		l := actor.NewActorLoader(fmt.Sprintf("auth-%d", i))
 		l.Init()
-		l.AddModule(mods.NewAuthMod(deps.Accounts))
+		l.AddModule(auth.NewAuthMgr(deps.Accounts))
 		// 接管丢弃上报：无返回值调用的失败没有调用方能接，
 		// 不接管的话框架只会往 stderr 打限流日志。这里全部计数并落日志。
 		l.SetDiscardedErrorHandler(h.onDiscarded)
@@ -99,8 +102,24 @@ func (that *Hub) AuthFor(uid string) *actor.ActorLoader {
 	return that.auth[sum.Sum32()%comm.AuthShards]
 }
 
+// LoadUser 给某个用户挂上他的 **_mod.go 模块。
+//
+// 规范第 7 条：Mgr 在启动时加载，Mod 在**用户登入成功之后**加载。
+// 登录成功时调它一次，用户的第一个业务请求就不必再付创建 actor 的钱。
+//
+// 它不占用 inFlight——只是把 actor 建出来，随后照常受空闲回收管辖。
+// 于是"登录了但一直不用"的用户会在 comm.UserIdleTimeout 之后被收走，
+// 不会因为登录过就永远留一条协程。
+func (that *Hub) LoadUser(uid string) {
+	that.AcquireUser(uid)
+	that.ReleaseUser(uid)
+}
+
 // AcquireUser 取（必要时创建）某个用户的 actor，并把它标记为使用中。
 // 用完必须调 ReleaseUser，否则这个 actor 永远不会被回收。
+//
+// 业务代码不该直接调它：取用与归还已经收进生成的门面里了
+// （见 note_export.go）。它导出只是因为门面和测试要用。
 func (that *Hub) AcquireUser(uid string) *actor.ActorLoader {
 	that.mu.Lock()
 	ua := that.users[uid]
@@ -108,7 +127,7 @@ func (that *Hub) AcquireUser(uid string) *actor.ActorLoader {
 		ua = &userActor{}
 		l := actor.NewActorLoader("user-" + uid)
 		l.Init()
-		l.AddModule(mods.NewNoteMod(that.deps.Notes, uid))
+		l.AddModule(note.NewNoteMod(that.deps.Notes, uid))
 		l.SetDiscardedErrorHandler(that.onDiscarded)
 		l.Start(&ua.wg)
 		ua.loader = l

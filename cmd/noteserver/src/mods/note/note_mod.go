@@ -1,4 +1,12 @@
-package mods
+// Package note 是笔记功能模块。
+//
+// 它是一个 **Mod**（挂在用户身上）而不是 **Mgr**（挂在服务器上）：判断标准是
+// "没有用户时这个功能是否也需要正常运行"。笔记不需要——没人在线时它没有任何
+// 事情可做。所以文件叫 note_mod.go，类型叫 NoteMod，由 Hub 在**用户登入成功
+// 之后**给他挂上，空闲一段时间再回收。
+//
+// 对照 mods/auth：登入验证在用户登进来之前就得能跑，所以那个是 AuthMgr。
+package note
 
 import (
 	"time"
@@ -9,7 +17,7 @@ import (
 	"actor"
 )
 
-//go:generate go -C ../../../.. run ./cmd/gercmd gen -force -tmpl cmd/noteserver/templates/user_export.tmpl -recv Hub cmd/noteserver/src/mods/note_mod.go cmd/noteserver/src/service
+//go:generate go -C ../../../../.. run ./cmd/gercmd gen -force -tmpl cmd/noteserver/templates/user_export.tmpl -recv Hub cmd/noteserver/src/mods/note/note_mod.go cmd/noteserver/src/service
 
 // NoteMod 管一个用户的笔记。每个在线用户一个 actor，一个 actor 一个 NoteMod。
 //
@@ -25,19 +33,23 @@ import (
 //
 // 注意它的方法签名里没有 uid：这个 actor 只服务一个账号，uid 在构造时就定死了。
 // 门面那一层才需要 uid——它得靠 uid 找到该用哪个 actor（见生成的 note_export.go）。
+//
+// 本模块没有 note_type.go：它的数据形状和跨模块用的 comm.NoteSnap 完全一致，
+// 再造一个模块私有类型只是抄字段。真有独属于本模块的类型时才建那个文件，
+// 且一旦发现别人也要用，就去 comm 建 **_comm.go 定义 **Snap 对外顶替。
 type NoteMod struct {
 	actor.ModObj[*NoteMod]
 
 	notes contract.INoteStore
 	uid   string
 
-	cache  []contract.NoteInfo // 最近 comm.NoteListLimit 条，按时间倒序
-	loaded bool                // cache 是否已经从存储预热过
+	cache  []comm.NoteSnap // 最近 comm.NoteListLimit 条，按时间倒序
+	loaded bool            // cache 是否已经从存储预热过
 }
 
 // NewNoteMod 建模块。uid 决定这个 actor 服务哪个账号。
 //
-// 返回 actor.IModule 的理由同 NewAuthMod：不给调用方绕过 actor 直接调方法的机会。
+// 返回 actor.IModule 的理由同 NewAuthMgr：不给调用方绕过 actor 直接调方法的机会。
 func NewNoteMod(notes contract.INoteStore, uid string) actor.IModule {
 	m := &NoteMod{notes: notes, uid: uid}
 	m.Init()
@@ -47,10 +59,10 @@ func NewNoteMod(notes contract.INoteStore, uid string) actor.IModule {
 // Add 存一条笔记，返回落库后的完整快照。上传时间由服务端生成，不采信客户端传来的时间。
 //
 //	export: NoteAdd
-func (that *NoteMod) Add(content string) (contract.NoteInfo, error) {
+func (that *NoteMod) Add(content string) (comm.NoteSnap, error) {
 	n, err := that.notes.Insert(that.uid, content, time.Now())
 	if err != nil {
-		return contract.NoteInfo{}, err
+		return comm.NoteSnap{}, err
 	}
 
 	// 落库成功才动缓存。顺序反了的话，插入失败会留下一条存储里没有的笔记，
@@ -61,7 +73,7 @@ func (that *NoteMod) Add(content string) (contract.NoteInfo, error) {
 	// 比原来的 INSERT 返回要弱——但对缓存一致性来说够了，
 	// 因为后续的 List 走的也是同一套存储。
 	if that.loaded {
-		that.cache = append([]contract.NoteInfo{n}, that.cache...)
+		that.cache = append([]comm.NoteSnap{n}, that.cache...)
 		if len(that.cache) > comm.NoteListLimit {
 			that.cache = that.cache[:comm.NoteListLimit]
 		}
@@ -72,7 +84,7 @@ func (that *NoteMod) Add(content string) (contract.NoteInfo, error) {
 // List 取笔记，按上传时间倒序。首次访问从存储预热缓存，之后直接命中。
 //
 //	export: NoteList
-func (that *NoteMod) List() ([]contract.NoteInfo, error) {
+func (that *NoteMod) List() ([]comm.NoteSnap, error) {
 	if !that.loaded {
 		notes, err := that.notes.List(that.uid, comm.NoteListLimit)
 		if err != nil {
@@ -85,7 +97,7 @@ func (that *NoteMod) List() ([]contract.NoteInfo, error) {
 	// 拷一份再返回：cache 归这个 actor 独占，直接把切片交出去，
 	// 调用方（HTTP 协程）就和事件循环共享了同一块底层数组，
 	// 下一次 Add 往里追加就是数据竞争。
-	out := make([]contract.NoteInfo, len(that.cache))
+	out := make([]comm.NoteSnap, len(that.cache))
 	copy(out, that.cache)
 	return out, nil
 }

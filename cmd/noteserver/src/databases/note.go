@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"noteserver/src/contract"
+	"noteserver/src/comm"
 
 	"github.com/norm/orm"
 )
@@ -27,8 +27,8 @@ type Note struct {
 	Content   string `orm:"name:content,comment:笔记正文"`
 }
 
-func (that *Note) snapshot() contract.NoteInfo {
-	return contract.NoteInfo{
+func (that *Note) snapshot() comm.NoteSnap {
+	return comm.NoteSnap{
 		NoteID:    that.NoteID,
 		Content:   that.Content,
 		CreatedAt: that.CreatedAt,
@@ -58,10 +58,10 @@ func NewNoteStore() *NoteStore {
 // 格式是 uid-毫秒时间戳-随机后缀，好处是主键本身可读、可按时间粗排，
 // 且 Norm 按 hash(pk) 把写入路由到固定 worker——同一用户的笔记会散到不同
 // worker 上并行落盘，不会互相排队。
-func (that *NoteStore) Insert(uid, content string, createdAt time.Time) (contract.NoteInfo, error) {
+func (that *NoteStore) Insert(uid, content string, createdAt time.Time) (comm.NoteSnap, error) {
 	id, err := newNoteID(uid, createdAt)
 	if err != nil {
-		return contract.NoteInfo{}, err
+		return comm.NoteSnap{}, err
 	}
 	n := &Note{
 		NoteID: id,
@@ -81,7 +81,7 @@ func (that *NoteStore) Insert(uid, content string, createdAt time.Time) (contrac
 // 走的是 MySQL，不吃 Redis 缓存——Norm 的缓存是按主键的，"某用户的笔记列表"
 // 不是一个主键。真正的缓存在上一层：NoteMod 把结果留在 actor 里，
 // 一个在线用户只会打到这里一次。
-func (that *NoteStore) List(uid string, limit int) ([]contract.NoteInfo, error) {
+func (that *NoteStore) List(uid string, limit int) ([]comm.NoteSnap, error) {
 	cond, err := eqCond("uid", uid)
 	if err != nil {
 		return nil, err
@@ -92,7 +92,7 @@ func (that *NoteStore) List(uid string, limit int) ([]contract.NoteInfo, error) 
 	if err != nil {
 		return nil, err
 	}
-	out := make([]contract.NoteInfo, 0, len(rows))
+	out := make([]comm.NoteSnap, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, r.snapshot())
 	}

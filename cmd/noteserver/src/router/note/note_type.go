@@ -1,7 +1,7 @@
 package note
 
 import (
-	"noteserver/src/contract"
+	"noteserver/src/comm"
 
 	"web"
 )
@@ -27,6 +27,6 @@ type UploadRequest struct {
 // count 是本次返回的条数，不是总数——列表最多返回 comm.NoteListLimit 条，
 // 客户端不该拿它当"我一共有多少条笔记"用。
 type ListResponse struct {
-	Count int                 `json:"count"`
-	Notes []contract.NoteInfo `json:"notes"`
+	Count int             `json:"count"`
+	Notes []comm.NoteSnap `json:"notes"`
 }

@@ -1,14 +1,31 @@
 {{- /*
-分片 actor 的门面模板（AuthMod 用）。
+分片 actor 的门面模板。
 
-用法：
-    gercmd gen -force -tmpl templates/shard_export.tmpl -recv Hub \
-        src/mods/auth_mod.go src/service
+【什么时候用这份】
+模块挂在一组**按业务键哈希分片**的 actor 上时用它——本项目里就是 AuthMgr
+（按手机号分片）。判断依据是"这个模块的 actor 怎么找到"，不是模块叫什么名字。
 
-与 gercmd 内置模板的四点不同，都是这个项目的需要：
+  * **_mod.go（每用户一个 actor）→ 一定用 user_export.tmpl，不要用这份；
+  * **_mgr.go 看 Hub 怎么持有它：分片持有就用这份；
+  * 如果以后出现**单例** Mgr（比如全局只有一个的邮件模块），两份都不合适——
+    that.AuthFor(uid) 拿不到它，需要再写一份取 loader 方式不同的模板。
+    模板之间的差别只有"怎么拿到 loader"那一行，照着改很快。
+
+【怎么调用】
+不要手敲命令。对应关系写在模块文件的 //go:generate 那一行里，那也是
+gercmd verify 读的地方——两边一旦分岔，校验就失去意义。所以统一：
+
+    go generate ./src/mods/...
+
+模块文件里那行长这样。注意它**必须是一行**——go:generate 不认 \ 折行，
+折了后半截会被当成普通注释、参数悄悄丢掉。路径相对仓库根，因为 -C 先切了过去：
+
+    //go:generate go -C ../../../../.. run ./cmd/gercmd gen -force -tmpl cmd/noteserver/templates/shard_export.tmpl -recv Hub cmd/noteserver/src/mods/auth/auth_mgr.go cmd/noteserver/src/service
+
+【与 gercmd 内置模板的四点不同】都是这个项目的需要：
 
   1. 宿主是 *service.Hub 而不是 PlayerEnt，loader 要按业务键挑：
-     AuthMod 挂在按手机号哈希分片的 actor 上，所以是 that.AuthFor(uid)。
+     AuthMgr 挂在按手机号哈希分片的 actor 上，所以是 that.AuthFor(uid)。
   2. 用 ModInvokeFrom(gid, ...) 而不是 ModInvoke。gid 由 HTTP 层每请求取一次
      再传进来——ModInvoke 每次都要解析调用栈（约 1.7µs），比投递本身还贵。
   3. **错误必须返回，不能吞**。内置模板是 println 之后返回零值，那会让存储故障
@@ -16,7 +33,7 @@
   4. 拆包逻辑交给手写的 unwrap（src/service/invoke.go），生成的文件因此不需要
      导入 fmt/reflect——模板没法往 .Imports 里加东西。
 
-对模块方法的两条约定，违反会让本模板生成非法 Go 代码、gen 当场失败：
+【对模块方法的两条约定】违反会让本模板生成非法 Go 代码、gen 当场失败：
 
   * 第一个参数必须叫 uid，它同时是分片键；
   * 要么没有返回值（投递即忘），要么正好是 (T, error)。

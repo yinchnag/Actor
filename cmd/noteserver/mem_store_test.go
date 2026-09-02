@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"noteserver/src/comm"
 	"noteserver/src/contract"
 )
 
@@ -16,12 +17,12 @@ import (
 
 type memAccounts struct {
 	mu     sync.Mutex // 多个 auth 分片会并发进来，必须加锁
-	data   map[string]contract.AccountInfo
+	data   map[string]comm.AccountSnap
 	onCall func(op string) error // 注入故障用
 }
 
 func newMemAccounts() *memAccounts {
-	return &memAccounts{data: make(map[string]contract.AccountInfo)}
+	return &memAccounts{data: make(map[string]comm.AccountSnap)}
 }
 
 func (that *memAccounts) fail(op string) error {
@@ -31,30 +32,30 @@ func (that *memAccounts) fail(op string) error {
 	return that.onCall(op)
 }
 
-func (that *memAccounts) Find(uid string) (contract.AccountInfo, error) {
+func (that *memAccounts) Find(uid string) (comm.AccountSnap, error) {
 	that.mu.Lock()
 	defer that.mu.Unlock()
 	if err := that.fail("Find"); err != nil {
-		return contract.AccountInfo{}, err
+		return comm.AccountSnap{}, err
 	}
 	acc, ok := that.data[uid]
 	if !ok {
-		return contract.AccountInfo{}, contract.ErrAccountNotFound
+		return comm.AccountSnap{}, contract.ErrAccountNotFound
 	}
 	return acc, nil
 }
 
-func (that *memAccounts) Create(uid, hash string) (contract.AccountInfo, error) {
+func (that *memAccounts) Create(uid, hash string) (comm.AccountSnap, error) {
 	that.mu.Lock()
 	defer that.mu.Unlock()
 	if err := that.fail("Create"); err != nil {
-		return contract.AccountInfo{}, err
+		return comm.AccountSnap{}, err
 	}
 	if _, ok := that.data[uid]; ok {
-		return contract.AccountInfo{}, contract.ErrPhoneTaken
+		return comm.AccountSnap{}, contract.ErrPhoneTaken
 	}
 	now := time.Now().UnixMilli()
-	acc := contract.AccountInfo{UID: uid, PasswordHash: hash, RegisterDate: now, LoginDate: now}
+	acc := comm.AccountSnap{UID: uid, PasswordHash: hash, RegisterDate: now, LoginDate: now}
 	that.data[uid] = acc
 	return acc, nil
 }
@@ -73,13 +74,13 @@ func (that *memAccounts) TouchLogin(uid string, at time.Time) error {
 
 type memNotes struct {
 	mu     sync.Mutex
-	data   map[string][]contract.NoteInfo
+	data   map[string][]comm.NoteSnap
 	seq    int64
 	onCall func(op string) error
 }
 
 func newMemNotes() *memNotes {
-	return &memNotes{data: make(map[string][]contract.NoteInfo)}
+	return &memNotes{data: make(map[string][]comm.NoteSnap)}
 }
 
 func (that *memNotes) fail(op string) error {
@@ -89,16 +90,16 @@ func (that *memNotes) fail(op string) error {
 	return that.onCall(op)
 }
 
-func (that *memNotes) Insert(uid, content string, at time.Time) (contract.NoteInfo, error) {
+func (that *memNotes) Insert(uid, content string, at time.Time) (comm.NoteSnap, error) {
 	that.mu.Lock()
 	defer that.mu.Unlock()
 	if err := that.fail("Insert"); err != nil {
-		return contract.NoteInfo{}, err
+		return comm.NoteSnap{}, err
 	}
 	that.seq++
 	// 主键形态跟 databases.newNoteID 对齐：uid-时间戳-唯一后缀。
 	// 后缀这里用自增而不是随机，是为了让下面的排序有确定结果。
-	n := contract.NoteInfo{
+	n := comm.NoteSnap{
 		NoteID:    uid + "-" + itoa64(at.UnixMilli()) + "-" + itoa64(that.seq),
 		Content:   content,
 		CreatedAt: at.UnixMilli(),
@@ -107,14 +108,14 @@ func (that *memNotes) Insert(uid, content string, at time.Time) (contract.NoteIn
 	return n, nil
 }
 
-func (that *memNotes) List(uid string, limit int) ([]contract.NoteInfo, error) {
+func (that *memNotes) List(uid string, limit int) ([]comm.NoteSnap, error) {
 	that.mu.Lock()
 	defer that.mu.Unlock()
 	if err := that.fail("List"); err != nil {
 		return nil, err
 	}
 	src := that.data[uid]
-	out := make([]contract.NoteInfo, len(src))
+	out := make([]comm.NoteSnap, len(src))
 	copy(out, src)
 	// 与 MySQL 的 ORDER BY created_at DESC, note_id DESC 保持一致
 	sort.SliceStable(out, func(i, j int) bool {

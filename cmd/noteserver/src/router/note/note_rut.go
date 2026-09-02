@@ -9,7 +9,6 @@ import (
 
 	"noteserver/src/bases"
 	"noteserver/src/comm"
-	"noteserver/src/contract"
 	"noteserver/src/middleware"
 
 	"github.com/gin-gonic/gin"
@@ -20,8 +19,8 @@ import (
 )
 
 // Note 持有路由需要的依赖。
-type Note struct {
-	web.Router[*Note]
+type NoteRut struct {
+	web.Router[*NoteRut]
 	hub service
 }
 
@@ -32,8 +31,8 @@ type Note struct {
 // 不再是"handler 要记得写 defer"的事。漏一次 Release 那个 actor 就永远
 // 不会被回收，这种错误不该靠人守。
 type service interface {
-	NoteAdd(gid uint64, uid string, content string) (contract.NoteInfo, error)
-	NoteList(gid uint64, uid string) ([]contract.NoteInfo, error)
+	NoteAdd(gid uint64, uid string, content string) (comm.NoteSnap, error)
+	NoteList(gid uint64, uid string) ([]comm.NoteSnap, error)
 }
 
 // New 建路由并挂到 group 上。
@@ -41,14 +40,14 @@ type service interface {
 // group 应当已经套好鉴权中间件——两个接口都要求登录。中间件仍然由调用方
 // 显式套在分组上，没有做成"标记里再加一个 auth tag"：谁需要登录是装配期的
 // 部署决定，藏进请求类型里反而更难看出来。
-func New(group gin.IRoutes, hub service) *Note {
-	n := &Note{hub: hub}
+func New(group gin.IRoutes, hub service) *NoteRut {
+	n := &NoteRut{hub: hub}
 	n.Init(group, bases.RouterOpts()...)
 	return n
 }
 
 // List 取笔记，按上传时间倒序。→ GET /notes
-func (that *Note) List(_ *ListRequest, ctx *gin.Context) {
+func (that *NoteRut) List(_ *ListRequest, ctx *gin.Context) {
 	uid := middleware.UID(ctx)
 
 	notes, err := that.hub.NoteList(actor.CurrentGID(), uid)
@@ -60,7 +59,7 @@ func (that *Note) List(_ *ListRequest, ctx *gin.Context) {
 }
 
 // Upload 上传一条笔记。→ POST /notes
-func (that *Note) Upload(req *UploadRequest, ctx *gin.Context) {
+func (that *NoteRut) Upload(req *UploadRequest, ctx *gin.Context) {
 	uid := middleware.UID(ctx)
 
 	// 只裁首尾空白，中间的换行和空格是笔记内容的一部分，不能动
