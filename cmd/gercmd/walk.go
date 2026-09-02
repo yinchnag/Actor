@@ -10,6 +10,9 @@ import (
 
 // Options 是三个遍历类子命令共用的选项。
 type Options struct {
+	// Naming 命名约定。零值表示用 defaultNaming()。
+	Naming Naming
+
 	// Recursive 为 true 时递归进入所有层级；为 false 时只看直接子条目。
 	Recursive bool
 	// SkipHidden 跳过以 . 开头的条目。隐藏目录会连同整棵子树一起剪掉，
@@ -81,6 +84,9 @@ func walkTree(root string, opt Options, warn io.Writer, fn func(walkEntry) error
 }
 
 // isHidden 判断条目名是否以点号开头。
+// naming 返回本次要用的命名约定，零值时退回默认。
+func (that Options) naming() Naming { return that.Naming.withDefaults() }
+
 func isHidden(name string) bool {
 	return strings.HasPrefix(name, ".")
 }

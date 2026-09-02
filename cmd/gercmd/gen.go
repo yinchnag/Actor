@@ -40,6 +40,8 @@ type GenOptions struct {
 	TemplateFile string
 	// Recv 门面方法的接收者类型名。
 	Recv string
+	// Naming 命名约定。零值表示用 defaultNaming()。
+	Naming Naming
 }
 
 // SkippedMethod 是被跳过的方法及原因。
@@ -61,8 +63,14 @@ type GenResult struct {
 	Written bool // 这次是否真的写了盘
 }
 
-// defaultRecv 是门面方法的接收者类型。GameSvr 的规范里就是它。
+// defaultRecv 是门面方法的接收者类型的默认值，取自 GameSvr 那一支模板。
+//
+// 它只是个默认值，别当成规定：noteserver 那一支的宿主是 Hub，所有 //go:generate
+// 里都显式写了 -recv。新项目照着自己的宿主传就行，不必改这里。
 const defaultRecv = "PlayerEnt"
+
+// naming 返回本次生成用的命名约定，零值时退回默认。
+func (that GenOptions) naming() Naming { return that.Naming.withDefaults() }
 
 // GenerateExports 读模块文件，为它的公有方法生成门面函数并写进 outDir。
 func GenerateExports(modFile, outDir string, opt GenOptions) (*GenResult, error) {
@@ -90,7 +98,7 @@ func GenerateExports(modFile, outDir string, opt GenOptions) (*GenResult, error)
 	}
 	res := &GenResult{
 		ModType: modType,
-		OutPath: filepath.Join(outDir, exportFileName(filepath.Base(modFile))),
+		OutPath: filepath.Join(outDir, opt.naming().ExportFileName(filepath.Base(modFile))),
 		OutPkg:  outPkg,
 	}
 	data := FacadeFile{
@@ -101,7 +109,7 @@ func GenerateExports(modFile, outDir string, opt GenOptions) (*GenResult, error)
 	}
 
 	// 门面函数名的前缀：BagMod → Bag。用户写的 export: BagAddItem 就是这么来的。
-	prefix := strings.TrimSuffix(modType, "Mod")
+	prefix := opt.naming().TrimTypeSuffix(modType)
 	r := newTypeRenderer(fileImports(doc.File), outPkg)
 
 	for i := range doc.Funcs {
@@ -229,16 +237,6 @@ func findModuleType(doc *gast.FileDoc) (string, error) {
 	}
 }
 
-// exportFileName 把模块文件名的 mod 换成 export：bag_mod.go → bag_export.go。
-// 名字里没有 mod 时退化成加后缀，保证总能得到一个可用的文件名。
-func exportFileName(base string) string {
-	stem := strings.TrimSuffix(base, ".go")
-	if i := strings.LastIndex(stem, "mod"); i >= 0 {
-		return stem[:i] + "export" + stem[i+len("mod"):] + ".go"
-	}
-	return stem + "_export.go"
-}
-
 // outputPackage 取输出目录的包名：优先读该目录下已有的 .go 文件，
 // 空目录则退回用目录名。读已有文件更可靠——目录名和包名不一定一致。
 func outputPackage(outDir string) (string, error) {
@@ -278,6 +276,7 @@ func runGen(args []string) int {
 	c.fs.BoolVar(&opt.DryRun, "n", false, "只打印生成内容，不写文件")
 	c.fs.StringVar(&opt.TemplateFile, "tmpl", "", "自定义模板文件，默认用内嵌模板")
 	c.fs.StringVar(&opt.Recv, "recv", defaultRecv, "门面方法的接收者类型名")
+	opt.Naming.bind(c.fs)
 	pos, code := c.parse(args, 2, 2)
 	if code != exitOK {
 		return code

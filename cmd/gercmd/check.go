@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"unicode"
 
 	gast "github.com/yinchnag/GCore/ast"
 )
@@ -68,34 +67,64 @@ func (c *ModuleCheck) AllOK() bool {
 // NormalizeModName 把用户给的名字规范成模块类型名。
 // bag / Bag / bagMod / BagMod 都归一到 BagMod，输入宽松、检查精确。
 func NormalizeModName(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
+	c := defaultNaming().TypeCandidates(s)
+	if len(c) == 0 {
 		return ""
 	}
-	// 先削掉已有的 Mod 后缀，免得 BagMod 变成 BagModMod
-	for _, suffix := range []string{"Mod", "mod"} {
-		if len(s) > len(suffix) && strings.HasSuffix(s, suffix) {
-			s = s[:len(s)-len(suffix)]
-			break
-		}
-	}
-	r := []rune(s)
-	r[0] = unicode.ToUpper(r[0])
-	return string(r) + "Mod"
+	return c[0]
 }
 
 // CheckModule 在 root 下递归查找 .go 文件，检查指定模块是否符合规范。
+//
+// 一个输入可能对应多个类型名：check auth 既可能指 AuthMod（挂用户），也可能指
+// AuthMgr（挂服务器）——光看名字分不出来。所以逐个候选去找，哪个的 struct 真的
+// 存在就检查哪个；都不存在时报第一个候选，并在提示里列出全部候选。
 func CheckModule(root, input string, opt Options) (*ModuleCheck, error) {
-	typeName := NormalizeModName(input)
-	if typeName == "" {
+	candidates := opt.naming().TypeCandidates(input)
+	if len(candidates) == 0 {
 		return nil, fmt.Errorf("模块名不能为空")
 	}
+	var first, informative *ModuleCheck
+	for _, name := range candidates {
+		res, err := checkOneType(root, input, name, opt)
+		if err != nil {
+			return nil, err
+		}
+		if res.Struct.OK {
+			return res, nil // 找到了，就是它
+		}
+		if first == nil {
+			first = res
+		}
+		// "名字被占了但不是 struct"这类诊断比"没找到"有用得多，别被候选提示盖掉
+		if informative == nil && res.Struct.Detail != notFoundDetail(name) {
+			informative = res
+		}
+	}
+	if informative != nil {
+		return informative, nil
+	}
+	if len(candidates) > 1 {
+		first.Struct.Detail = fmt.Sprintf("%s（候选：%s）",
+			notFoundDetail(candidates[0]), strings.Join(candidates, " / "))
+	}
+	return first, nil
+}
+
+// notFoundDetail 是"压根没找到这个 struct"的说法。单独拎出来，
+// 是为了上面能判断某个候选的结论到底是"没找到"还是别的更具体的诊断。
+func notFoundDetail(typeName string) string {
+	return fmt.Sprintf("没有找到 struct %s", typeName)
+}
+
+// checkOneType 按一个确定的类型名做检查。
+func checkOneType(root, input, typeName string, opt Options) (*ModuleCheck, error) {
 	res := &ModuleCheck{
 		Input:    input,
 		TypeName: typeName,
-		CtorName: "New" + typeName,
+		CtorName: opt.naming().CtorName(typeName),
 	}
-	res.Struct.Detail = fmt.Sprintf("没有找到 struct %s", typeName)
+	res.Struct.Detail = notFoundDetail(typeName)
 	res.Embed.Detail = "struct 都没找到，无从检查"
 	res.Ctor.Detail = fmt.Sprintf("没有找到函数 %s", res.CtorName)
 
@@ -404,6 +433,7 @@ func runCheck(args []string) int {
 		"模块名给 bag / Bag / BagMod 都行，会归一到 BagMod。\n"+
 			"不给路径时在当前目录下递归查找。")
 	c.fs.BoolVar(&opt.SkipHidden, "skip-hidden", false, "跳过以 . 开头的目录与文件")
+	opt.Naming.bind(c.fs)
 	pos, code := c.parse(args, 1, 2)
 	if code != exitOK {
 		return code

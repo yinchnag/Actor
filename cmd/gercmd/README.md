@@ -16,6 +16,7 @@ python cmd/gercmd/build.py --all     # 常见平台各编一份
 |---|---|
 | `check` | 检查模块是否符合模块规范 |
 | `gen` | 为模块的公有方法生成门面函数 |
+| `verify` | 校验生成的门面是否还与模块一致 |
 | `dirs` | 列出路径下的文件夹 |
 | `files` | 列出路径下的文件 |
 | `cat` | 打印文件内容 |
@@ -27,7 +28,8 @@ python cmd/gercmd/build.py --all     # 常见平台各编一份
 ## check —— 模块规范闸门
 
 ```bash
-gercmd check bag cmd/GameSvr        # 模块名给 bag / Bag / bagMod / BagMod 都行
+gercmd check bag cmd/GameSvr        # 名字给 bag / Bag / bagMod / BagMod 都行
+gercmd check auth cmd/noteserver/src # 分不清 Mod 还是 Mgr？候选都试一遍
 gercmd check bag                    # 不给路径就在当前目录下递归找
 ```
 
@@ -84,7 +86,14 @@ gercmd gen cmd/GameSvr/bag/bag_mod.go cmd/GameSvr/player        # 落盘
 gercmd gen -force ...                                            # 覆盖已有文件
 ```
 
-输出文件名把 `mod` 换成 `export`：`bag_mod.go` → `bag_export.go`。
+输出文件名剥掉末尾的 `_mod` / `_mgr`，再加 `_export`：
+
+    bag_mod.go   → bag_export.go
+    auth_mgr.go  → auth_export.go
+
+两个后缀都认：模块按"挂在用户身上还是挂在服务器上"分成 `**_mod.go` 与 `**_mgr.go`，
+但生成的门面没有这个区别——都是挂在同一个宿主上的普通方法，文件名里再带 mod/mgr
+只会让人以为那是两类东西。不合命名约定的文件一律退化成加后缀。
 **默认不覆盖已存在的文件**——门面文件里往往有手写代码，静默覆盖等于毁掉别人的工作。
 
 ### export: 标记
@@ -137,6 +146,116 @@ go test ./cmd/gercmd/ -run TestGenCompiles      # 把生成结果真编译一遍
 ```
 
 ---
+
+## 命名约定可配置
+
+gercmd 同时服务两支项目模板 —— 游戏服务器照 `cmd/GameSvr`、Web 服务器照
+`cmd/noteserver`，它们的约定不完全一样，以后还会有第三支。所以**约定不写死在
+代码里**，集中在 `naming.go`，并且全部开成参数（`check` / `gen` / `verify` 都认）：
+
+| 参数 | 默认值 | 管什么 |
+|---|---|---|
+| `-mod-suffix` | `_mod,_mgr` | 模块文件后缀 |
+| `-type-suffix` | `Mod,Mgr` | 模块类型名后缀 |
+| `-export-suffix` | `_export` | 生成物文件后缀 |
+| `-ctor-prefix` | `New` | 构造函数前缀 |
+| `-recv` | `PlayerEnt` | 门面方法的接收者类型（`gen` / `verify`） |
+
+默认值取两支模板的**并集**，于是它们都不必传参。约定完全不同的项目传参即可：
+
+```bash
+# 一个用 **_service.go / **Service / MakeXxx / **_api.go 的项目
+gercmd check -type-suffix Service -ctor-prefix Make shop ./src
+gercmd gen   -mod-suffix _service -export-suffix _api -recv Gateway              src/logic/shop_service.go src/facade
+gercmd verify -mod-suffix _service -export-suffix _api ./src
+```
+
+`-recv` 的默认值 `PlayerEnt` 取自 GameSvr 那一支，**只是个默认值不是规定**：
+noteserver 的宿主是 `Hub`，它所有 `//go:generate` 里都显式写了 `-recv`。
+
+> 路径本身从来不写死——全部来自命令行参数。写死过的是这些**命名约定**，
+> 而且早先只照顾了 GameSvr 一支：`check` 无条件给名字补 `Mod` 后缀，
+> 于是 `check auth` 去找 `AuthMod`、找不到 noteserver 的 `AuthMgr`。
+
+### check 会试所有候选
+
+`check auth` 分不清你指的是 `AuthMod`（挂用户）还是 `AuthMgr`（挂服务器）——
+名字里没有这个信息。所以它把候选都试一遍，哪个的 struct 真的存在就检查哪个；
+都不存在时报第一个，并在提示里列出全部候选：
+
+```
+✗  struct AuthMod
+   没有找到 struct AuthMod（候选：AuthMod / AuthMgr）
+```
+
+"名字被占了但不是 struct"这类更具体的诊断优先于候选提示 —— 那种情况下用户
+需要的是"你把 BagMod 定义成别的东西了"，而不是一句"没找到"。
+
+## verify —— 生成物是否还是最新的
+
+```bash
+gercmd verify cmd/noteserver/src          # 递归校验
+gercmd verify -strict cmd/noteserver/src  # 把"模块没有 go:generate"也算失败
+```
+
+它抓的是一类**编译得过**的错，所以人和编译器都发现不了：
+
+- 改了模块方法的签名，忘了重新生成，门面还是旧的；
+- 改了模块文件名（`auth_mod.go` → `auth_mgr.go`），生成物换了名字，
+  旧的那份留在原地继续参与编译，内容是对的、只是过期了；
+- 删了一个模块，它的门面还在。
+
+做法是**自己发现，不要清单**：
+
+1. 递归找 `**_mod.go` / `**_mgr.go`；
+2. 读它们各自 `//go:generate` 里的 `gercmd gen` 参数 —— 模板、接收者、输出目录
+   本来就全写在那儿，那是唯一的事实来源；
+3. 按同样的参数重新生成一遍（只在内存里），与磁盘上的文件比；
+4. 反过来扫输出目录，报告没有任何模块对应的多余 `**_export.go`。
+
+> 早先这件事是让使用方在自己的测试里手写一张"模块 → 模板 → 生成物"的表。
+> 那张表本身就是新的人为出错点：加了模块忘了登记，检查就默默漏掉它。
+> **检查工具自己需要人来维护，等于没有检查**，所以改成现在这样。
+
+`//go:generate` 里的 `-C` 会被还原：`go -C ../.. run ./cmd/gercmd gen ...` 里的路径
+是相对 `-C` 那个目录的，verify 照着算，于是在哪个目录下跑都对得上。
+
+判定与退出码：
+
+| 状态 | 含义 | 计入失败 |
+|---|---|---|
+| `✓ ok` | 生成物与模块一致 | |
+| `· noexport` | 模块没有 `export:` 标记，正确地不产生生成物 | **否** |
+| `✗ stale` | 内容对不上，跑一次 `go generate` | 是 |
+| `✗ missing` | 该有生成物却没有 | 是 |
+| `✗ leftover` | **不该**有生成物却有——标记删了、文件没删 | 是 |
+| `✗ error` | 指令解析或生成失败 | 是 |
+| `✗` 残留 | 输出目录里没人认领的 `**_export.go` | 是 |
+| `· nodirective` | 模块没有 `//go:generate`，无从校验 | 仅 `-strict` |
+
+### noexport 与 nodirective 必须分开
+
+两者都表现为"没有生成物"，含义却**相反**：
+
+- `noexport` 是**校验过了**——生成器跑了，结论是这个模块不该产生门面。
+  模块只有内部方法是合法设计，所以它**永远不算失败**，`-strict` 也不升级它。
+- `nodirective` 是**压根没校验**，多半是漏写了指令。`-strict` 就是为它设的。
+
+混成一个状态的话，`-strict` 想拦第二种就会连第一种一起误伤：一个合法的纯内部
+模块能让整个校验变红。`cmd/noteserver` 的 `TestFacadesUpToDate` 跑的正是
+`verify -strict`，混判会让它一加内部模块就失败。
+
+`nodirective` 默认不算失败，是为了不误伤手工生成门面的项目（`cmd/GameSvr` 就是）。
+
+### leftover 为什么不交给孤儿检查
+
+"把方法上的 `export:` 删了、忘了删生成物"这一步很常见，而那份残留躲得过孤儿
+检查：模块还在，它的输出路径就还登记在 `expected` 里，等于给残留打掩护。
+反过来把模块文件整个删掉倒能查出来——也就是说漏洞开在**更常见**的那条路上。
+
+所以这一判定放在 `verifyOne` 里而不是 `findOrphans`。诊断也只有在那里才说得准：
+孤儿检查那句"多半是改了模块文件名之后忘了删旧的生成物"在这个场景下是错的，
+会把人引向改文件名的方向。
 
 ## dirs / files / cat
 
@@ -203,6 +322,13 @@ go test ./cmd/gercmd/ -count=1
   只要产出变了就先红。
 - **`TestCheckRealGameSvr` / `TestExportRealGameSvr`** —— 拿仓库里真实的 GameSvr
   模块跑一遍。规范校验器要是对自家规范的样板都判错，那就没意义了。
+- **`TestVerify*`** —— verify 的价值全在"能不能抓到那几种编译得过的错"，所以整组
+  测试都围绕失败场景造：过期、缺失、残留、指令缺失、`-C` 还原。只验"正常情况通过"
+  没有意义。
+- **`TestNamingDefaultsCoverBothTemplates` / `TestWithDefaultsIsPerField`** ——
+  前者保证默认约定同时覆盖 GameSvr 与 noteserver 两支模板（只照顾一支的话，
+  另一支每条命令都得带参数）；后者钉住一个真踩过的坑：只改一项约定时，
+  其余项要退回默认而不是把这一项也一起吞掉。
 
 ## 依赖
 

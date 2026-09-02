@@ -330,15 +330,21 @@ func TestGenDryRunWritesNothing(t *testing.T) {
 
 func TestExportFileName(t *testing.T) {
 	for in, want := range map[string]string{
-		"bag_mod.go":   "bag_export.go",
-		"hero_mod.go":  "hero_export.go",
-		"mod.go":       "export.go",
-		"bagmod.go":    "bagexport.go",
+		// 合规命名：剥掉末尾的 _mod / _mgr，再加 _export
+		"bag_mod.go":  "bag_export.go",
+		"hero_mod.go": "hero_export.go",
+		"auth_mgr.go": "auth_export.go",
+		"mail_mgr.go": "mail_export.go",
+		// 不合规的一律退化成加后缀。早先按子串替换会把 bagmod.go 变成
+		// bagexport.go、mod_thing.go 变成 export_thing.go，那类结果没人能预测。
+		"mod.go":       "mod_export.go",
+		"mgr.go":       "mgr_export.go",
+		"bagmod.go":    "bagmod_export.go",
+		"mod_thing.go": "mod_thing_export.go",
 		"nomarker.go":  "nomarker_export.go",
-		"mod_thing.go": "export_thing.go",
 	} {
-		if got := exportFileName(in); got != want {
-			t.Errorf("exportFileName(%q) = %q, want %q", in, got, want)
+		if got := defaultNaming().ExportFileName(in); got != want {
+			t.Errorf("ExportFileName(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
@@ -435,12 +441,6 @@ func TestGeneratedFacadesUpToDate(t *testing.T) {
 				res.OutPath, line, a, b, filepath.ToSlash(modFile), filepath.ToSlash(outDir))
 		})
 	}
-}
-
-// normalizeEOL 统一行尾。仓库在 Windows 上按 autocrlf 检出是 CRLF，
-// 而生成器始终输出 LF，不归一化的话上面那条测试会跟着检出设置飘。
-func normalizeEOL(b []byte) string {
-	return strings.ReplaceAll(string(b), "\r\n", "\n")
 }
 
 // firstDiffLine 找出两份内容第一处不同的行。

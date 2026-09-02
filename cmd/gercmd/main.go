@@ -31,6 +31,7 @@ var commands = []struct {
 	{"cat", "打印文件内容", runCat},
 	{"check", "检查模块是否符合规范", runCheck},
 	{"gen", "生成门面函数", runGen},
+	{"verify", "校验门面生成物是否最新", runVerify},
 }
 
 func main() {
