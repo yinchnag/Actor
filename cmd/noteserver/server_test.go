@@ -2,161 +2,72 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"sort"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"noteserver/src/comm"
+	"noteserver/src/middleware"
+	"noteserver/src/router/auth"
+	"noteserver/src/router/health"
+	"noteserver/src/router/note"
+	"noteserver/src/service"
+
+	"github.com/gin-gonic/gin"
 )
 
-// --- 内存存储：让 actor 编排和 HTTP 层能在没有 MySQL/Redis 的环境里被完整测到 ---
-
-type memStore struct {
-	mu     sync.Mutex // 多个 actor（auth 分片 + 各用户）会并发进来，必须加锁
-	users  map[string]*User
-	nextU  int64
-	notes  map[int64][]Note
-	nextN  int64
-	onCall func(op string) error // 注入故障用
+func TestMain(m *testing.M) {
+	// 关掉 gin 的调试输出，否则每装一次路由都刷一屏
+	gin.SetMode(gin.TestMode)
+	code := m.Run()
+	// 真实模式的压测用的是包级连接池，只能在所有用例跑完之后关一次，
+	// 不能挂在某个用例的 Cleanup 上——见 stress_test.go 里 realStorage 的注释。
+	shutdownRealStorage()
+	os.Exit(code)
 }
-
-func newMemStore() *memStore {
-	return &memStore{
-		users: make(map[string]*User),
-		notes: make(map[int64][]Note),
-	}
-}
-
-func (s *memStore) fail(op string) error {
-	if s.onCall == nil {
-		return nil
-	}
-	return s.onCall(op)
-}
-
-func (s *memStore) CreateUser(_ context.Context, phone, hash string) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.fail("CreateUser"); err != nil {
-		return 0, err
-	}
-	if _, ok := s.users[phone]; ok {
-		return 0, ErrPhoneTaken
-	}
-	s.nextU++
-	s.users[phone] = &User{ID: s.nextU, Phone: phone, PasswordHash: hash}
-	return s.nextU, nil
-}
-
-func (s *memStore) FindUserByPhone(_ context.Context, phone string) (*User, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.fail("FindUserByPhone"); err != nil {
-		return nil, err
-	}
-	u, ok := s.users[phone]
-	if !ok {
-		return nil, ErrUserNotFound
-	}
-	cp := *u
-	return &cp, nil
-}
-
-func (s *memStore) InsertNote(_ context.Context, userID int64, content string, at time.Time) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.fail("InsertNote"); err != nil {
-		return 0, err
-	}
-	s.nextN++
-	s.notes[userID] = append(s.notes[userID], Note{ID: s.nextN, Content: content, CreatedAt: at})
-	return s.nextN, nil
-}
-
-func (s *memStore) ListNotes(_ context.Context, userID int64, limit int) ([]Note, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.fail("ListNotes"); err != nil {
-		return nil, err
-	}
-	src := s.notes[userID]
-	out := make([]Note, len(src))
-	copy(out, src)
-	// 与 MySQL 的 ORDER BY created_at DESC, id DESC 保持一致
-	sort.SliceStable(out, func(i, j int) bool {
-		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
-			return out[i].CreatedAt.After(out[j].CreatedAt)
-		}
-		return out[i].ID > out[j].ID
-	})
-	if len(out) > limit {
-		out = out[:limit]
-	}
-	return out, nil
-}
-
-func (s *memStore) Close() error { return nil }
-
-func (s *memStore) noteCount(userID int64) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.notes[userID])
-}
-
-type memSessions struct {
-	mu   sync.Mutex
-	data map[string]int64
-}
-
-func newMemSessions() *memSessions { return &memSessions{data: make(map[string]int64)} }
-
-func (s *memSessions) Put(_ context.Context, token string, userID int64, _ time.Duration) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.data[token] = userID
-	return nil
-}
-
-func (s *memSessions) Get(_ context.Context, token string) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	id, ok := s.data[token]
-	if !ok {
-		return 0, ErrNoSession
-	}
-	return id, nil
-}
-
-func (s *memSessions) Delete(_ context.Context, token string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.data, token)
-	return nil
-}
-
-func (s *memSessions) Close() error { return nil }
 
 // --- 测试脚手架 ---
 
 type harness struct {
-	t    *testing.T
-	ts   *httptest.Server
-	hub  *Hub
-	strg *memStore
+	t     *testing.T
+	ts    *httptest.Server
+	hub   *service.Hub
+	accs  *memAccounts
+	notes *memNotes
 }
 
+// newHarness 装出一套与 main 完全相同的路由，只是把三个存储换成内存实现。
+//
+// 引擎是当场新建的，不用 bases.R：那是个包级变量，多个测试往同一个引擎上
+// 装同一批路径，第二次就会 panic。路由构造函数收 *gin.RouterGroup 而不是
+// 直接用全局分组，就是为了这里。
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	store := newMemStore()
-	hub := NewHub(store)
-	ts := httptest.NewServer(NewServer(hub, newMemSessions()).Routes())
-	h := &harness{t: t, ts: ts, hub: hub, strg: store}
+
+	accs, notes := newMemAccounts(), newMemNotes()
+	hub := service.NewHub(service.Deps{
+		Accounts: accs,
+		Notes:    notes,
+		Sessions: newMemSessions(),
+	})
+
+	engine := gin.New()
+	engine.Use(gin.Recovery())
+	v1 := engine.Group("/api")
+	health.New(engine, hub)
+	auth.New(v1, hub)
+	// 与 main 一样：路径来自请求类型上的 path tag，分组只负责套鉴权
+	note.New(v1.Group("", middleware.Auth(hub.Sessions())), hub)
+
+	ts := httptest.NewServer(engine)
+	h := &harness{t: t, ts: ts, hub: hub, accs: accs, notes: notes}
 	t.Cleanup(func() {
 		ts.Close() // 先停 HTTP，让在途请求释放手上的 actor
 		hub.Close()
@@ -164,29 +75,29 @@ func newHarness(t *testing.T) *harness {
 	return h
 }
 
-func (h *harness) do(method, path, token string, body any) (int, map[string]any) {
-	h.t.Helper()
+func (that *harness) do(method, path, token string, body any) (int, map[string]any) {
+	that.t.Helper()
 	var rdr *bytes.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
-			h.t.Fatalf("序列化请求失败: %v", err)
+			that.t.Fatalf("序列化请求失败: %v", err)
 		}
 		rdr = bytes.NewReader(b)
 	} else {
 		rdr = bytes.NewReader(nil)
 	}
-	req, err := http.NewRequest(method, h.ts.URL+path, rdr)
+	req, err := http.NewRequest(method, that.ts.URL+path, rdr)
 	if err != nil {
-		h.t.Fatalf("构造请求失败: %v", err)
+		that.t.Fatalf("构造请求失败: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	resp, err := h.ts.Client().Do(req)
+	resp, err := that.ts.Client().Do(req)
 	if err != nil {
-		h.t.Fatalf("请求失败: %v", err)
+		that.t.Fatalf("请求失败: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -195,34 +106,34 @@ func (h *harness) do(method, path, token string, body any) (int, map[string]any)
 	return resp.StatusCode, out
 }
 
-// register 注册并返回 userID。
-func (h *harness) register(phone, pw string) int64 {
-	h.t.Helper()
-	code, body := h.do(http.MethodPost, "/api/register", "", map[string]string{
+// register 注册并返回 uid。
+func (that *harness) register(phone, pw string) string {
+	that.t.Helper()
+	code, body := that.do(http.MethodPost, "/api/register", "", map[string]string{
 		"phone": phone, "password": pw,
 	})
 	if code != http.StatusCreated {
-		h.t.Fatalf("注册失败: code=%d body=%v", code, body)
+		that.t.Fatalf("注册失败: code=%d body=%v", code, body)
 	}
-	id, ok := body["user_id"].(float64)
-	if !ok {
-		h.t.Fatalf("响应缺少 user_id: %v", body)
+	uid, ok := body["uid"].(string)
+	if !ok || uid == "" {
+		that.t.Fatalf("响应缺少 uid: %v", body)
 	}
-	return int64(id)
+	return uid
 }
 
 // login 登录并返回 token。
-func (h *harness) login(phone, pw string) string {
-	h.t.Helper()
-	code, body := h.do(http.MethodPost, "/api/login", "", map[string]string{
+func (that *harness) login(phone, pw string) string {
+	that.t.Helper()
+	code, body := that.do(http.MethodPost, "/api/login", "", map[string]string{
 		"phone": phone, "password": pw,
 	})
 	if code != http.StatusOK {
-		h.t.Fatalf("登录失败: code=%d body=%v", code, body)
+		that.t.Fatalf("登录失败: code=%d body=%v", code, body)
 	}
 	token, ok := body["token"].(string)
 	if !ok || token == "" {
-		h.t.Fatalf("响应缺少 token: %v", body)
+		that.t.Fatalf("响应缺少 token: %v", body)
 	}
 	return token
 }
@@ -233,9 +144,9 @@ func (h *harness) login(phone, pw string) string {
 func TestFullFlow(t *testing.T) {
 	h := newHarness(t)
 
-	userID := h.register("13800138000", "sup3r-secret")
-	if userID == 0 {
-		t.Fatal("user_id 不该为 0")
+	uid := h.register("13800138000", "sup3r-secret")
+	if uid != "13800138000" {
+		t.Fatalf("uid 应当就是手机号, got %q", uid)
 	}
 	token := h.login("13800138000", "sup3r-secret")
 
@@ -357,7 +268,9 @@ func TestDuplicateRegister(t *testing.T) {
 // TestConcurrentRegisterSamePhone 并发注册同一个手机号，只能有一个成功。
 //
 // 这是 auth actor 按手机号分片的意义所在：同一号码永远落到同一个 actor，
-// "查重—插入"两步天然串行，不靠数据库唯一索引也不会同时通过查重。
+// "查重—建号"两步天然串行。换成 Norm 之后这条更关键了——它的异步 Save
+// 走 INSERT ... ON DUPLICATE KEY UPDATE，唯一冲突既不报错也没有返回值，
+// 数据库那一层已经兜不住重复注册，只剩应用层这一道。
 func TestConcurrentRegisterSamePhone(t *testing.T) {
 	h := newHarness(t)
 
@@ -470,8 +383,8 @@ func TestNoteContentValidation(t *testing.T) {
 	}{
 		{"空", "", http.StatusBadRequest},
 		{"全是空白", "   \n\t  ", http.StatusBadRequest},
-		{"刚好到上限", strings.Repeat("字", maxNoteRunes), http.StatusCreated},
-		{"超出上限", strings.Repeat("字", maxNoteRunes+1), http.StatusRequestEntityTooLarge},
+		{"刚好到上限", strings.Repeat("字", comm.MaxNoteRunes), http.StatusCreated},
+		{"超出上限", strings.Repeat("字", comm.MaxNoteRunes+1), http.StatusRequestEntityTooLarge},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			code, body := h.do(http.MethodPost, "/api/notes", token,
@@ -489,7 +402,7 @@ func TestNoteContentValidation(t *testing.T) {
 // 所以内存缓存和存储不可能对不上——业务代码里一把锁都没有。
 func TestConcurrentUploadSameUser(t *testing.T) {
 	h := newHarness(t)
-	userID := h.register("13177317731", "dave-password")
+	uid := h.register("13177317731", "dave-password")
 	token := h.login("13177317731", "dave-password")
 
 	// 先读一次把缓存预热，这样后续上传走的是"改缓存 + 写库"两条都要对齐的路径
@@ -516,7 +429,7 @@ func TestConcurrentUploadSameUser(t *testing.T) {
 			t.Fatalf("第 %d 次上传返回 %d", i, c)
 		}
 	}
-	if n := h.strg.noteCount(userID); n != uploads {
+	if n := h.notes.count(uid); n != uploads {
 		t.Fatalf("存储里有 %d 条，期望 %d 条", n, uploads)
 	}
 
@@ -556,7 +469,7 @@ func TestIdleUserActorEvicted(t *testing.T) {
 	}
 
 	// 直接推进"当前时间"触发回收，不用真等 5 分钟
-	if evicted := h.hub.evictIdle(time.Now().Add(userIdleTimeout + time.Minute)); evicted != 1 {
+	if evicted := h.hub.EvictIdle(time.Now().Add(comm.UserIdleTimeout + time.Minute)); evicted != 1 {
 		t.Fatalf("应当回收 1 个 actor, got %d", evicted)
 	}
 	if n := h.hub.OnlineUsers(); n != 0 {
@@ -580,15 +493,15 @@ func TestIdleUserActorEvicted(t *testing.T) {
 // 否则在途请求会撞上 actor is closed。
 func TestInFlightUserActorNotEvicted(t *testing.T) {
 	h := newHarness(t)
-	userID := h.register("13055305530", "frank-password")
+	uid := h.register("13055305530", "frank-password")
 
-	h.hub.AcquireUser(userID) // 模拟一个还没结束的请求
-	if evicted := h.hub.evictIdle(time.Now().Add(24 * time.Hour)); evicted != 0 {
+	h.hub.AcquireUser(uid) // 模拟一个还没结束的请求
+	if evicted := h.hub.EvictIdle(time.Now().Add(24 * time.Hour)); evicted != 0 {
 		t.Fatalf("使用中的 actor 不该被回收, evicted=%d", evicted)
 	}
-	h.hub.ReleaseUser(userID)
+	h.hub.ReleaseUser(uid)
 
-	if evicted := h.hub.evictIdle(time.Now().Add(24 * time.Hour)); evicted != 1 {
+	if evicted := h.hub.EvictIdle(time.Now().Add(24 * time.Hour)); evicted != 1 {
 		t.Fatalf("释放之后应当可以回收, evicted=%d", evicted)
 	}
 }
@@ -600,17 +513,29 @@ func TestStoreFailureSurfacedNotSwallowed(t *testing.T) {
 	h.register("13044304430", "grace-password")
 	token := h.login("13044304430", "grace-password")
 
-	h.strg.mu.Lock()
-	h.strg.onCall = func(op string) error {
-		if op == "InsertNote" {
+	h.notes.mu.Lock()
+	h.notes.onCall = func(op string) error {
+		if op == "Insert" {
 			return fmt.Errorf("模拟数据库故障")
 		}
 		return nil
 	}
-	h.strg.mu.Unlock()
+	h.notes.mu.Unlock()
 
 	code, body := h.do(http.MethodPost, "/api/notes", token, map[string]string{"content": "写不进去的笔记"})
 	if code < 500 {
 		t.Fatalf("存储故障应当返回 5xx, got %d body=%v", code, body)
+	}
+}
+
+// TestHealthz 探活接口报当前存活的用户 actor 数。
+func TestHealthz(t *testing.T) {
+	h := newHarness(t)
+	code, body := h.do(http.MethodGet, "/healthz", "", nil)
+	if code != http.StatusOK {
+		t.Fatalf("code=%d", code)
+	}
+	if n, ok := body["online_users"].(float64); !ok || n != 0 {
+		t.Fatalf("online_users 应当是 0, got %v", body)
 	}
 }

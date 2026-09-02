@@ -2,21 +2,43 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Build deadlock_demo",
+            "label": "Build noteserver",
             "type": "shell",
             "command": "go",
             "args": [
                 "build",
                 "-o",
-                "bin/deadlock_demo.exe",
-                "./cmd/deadlock_demo"
+                "noteserver.exe",
+                "."
             ],
+            "options": {
+                "cwd": "${workspaceFolder}/cmd/noteserver"
+            },
             "group": {
                 "kind": "build",
                 "isDefault": true
             },
             "presentation": {
                 "reveal": "silent",
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Test noteserver",
+            "type": "shell",
+            "command": "go",
+            "args": [
+                "test",
+                "./...",
+                "-count=1"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/cmd/noteserver"
+            },
+            "group": "test",
+            "presentation": {
+                "reveal": "always",
                 "panel": "shared"
             },
             "problemMatcher": []

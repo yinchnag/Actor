@@ -346,15 +346,35 @@ func NewBagMod(p *PlayerEnt) *BagMod { m := &BagMod{host: p}; m.Init(); return m
 ## 八、完整示例
 
 `cmd/noteserver/` 是一个基于本框架的 HTTP 服务（手机号注册、登录、上传/获取笔记），
-跑通过真实 MySQL + Redis。它演示了本文档里几乎所有注意事项的落地方式：
+用 Gin 做路由、Norm ORM 跑通真实 MySQL + Redis。它演示了本文档里几乎所有注意事项的
+落地方式：
 
-- 按业务键分片的 actor（注册的「查重—插入」串行化）
+- 按业务键分片的 actor（注册的「查重—建号」串行化）
 - 每用户一个 actor + 空闲回收（在线用户数决定协程数）
 - CPU 密集的活留在调用方协程
+- 无返回值的模块方法里不能 panic（会连带关掉整个 actor）
 - 超时语义直接映射成 HTTP 状态码
 - 哪些操作**不**该进 actor
 
+它有自己的 `go.mod`（`replace actor => ../..`），所以本仓库的 `go build ./...` 和
+`go test ./...` 都不会走进去——要跑它的测试得先 `cd cmd/noteserver`。这样分开是为了
+让框架本身不必背上 gin 和 ORM 的依赖。
+
 详见 `cmd/noteserver/README.md`。
+
+## 附：web/ 模块
+
+`web/` 是与本框架**平级的另一个可复用件**，不是它的一部分：一套基于 gin 的自动路由，
+路由结构体内嵌 `Router[*自己]`，公有方法被反射扫成 HTTP 接口。
+
+它和 `ModObj[T]` 是同一种 CRTP 思路，但**一行本框架的代码都没引用**——
+两者解决的是不同的问题（一个是跨 goroutine 按方法名调用模块，一个是按方法签名
+生成 HTTP 路由）。
+
+单独成模块是为了 gin：它会拖进 26 个传递依赖。只想要 actor 并发模型、不做 HTTP 的
+项目不该为此买单，所以本模块的 `go.mod` 里没有 gin，以后也不该有。
+
+详见 `web/README.md`。
 
 ---
 

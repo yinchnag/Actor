@@ -49,8 +49,8 @@ coverage.txt
 *.iml
 .DS_Store
 
-# 注意：.env 目前是入库的，里面是本机开发用的占位口令（README 已写明）。
-# 如果要在里面放真实口令，取消下面这行的注释，并执行：
-#     git rm --cached .env
-# 同时留一份 .env.example 说明需要哪些键。
-# .env
+# noteserver 的配置从 .env 换成了 cmd/noteserver/data/*.json，那两份也是入库的，
+# 里面是本机开发用的占位口令（README 已写明）。要在里面放真实口令的话，
+# 取消下面两行的注释并 git rm --cached 掉它们，同时留一份 .example 说明需要哪些键。
+# /cmd/noteserver/data/orm.json
+# /cmd/noteserver/data/server.json

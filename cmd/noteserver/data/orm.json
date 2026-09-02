@@ -1,0 +1,18 @@
+{
+  "mysql": {
+    "dsn": "root:rootpassword@tcp(127.0.0.1:3306)/notebook?charset=utf8mb4&parseTime=True&loc=Local&timeout=2s&readTimeout=2s&writeTimeout=2s",
+    "max_open_conns": 32,
+    "max_idle_conns": 8,
+    "conn_max_lifetime": 1800
+  },
+  "redis": {
+    "addr": "127.0.0.1:6379",
+    "password": "",
+    "db": 0,
+    "pool_size": 50,
+    "min_idle_conns": 10,
+    "key_ttl_sec": 604800
+  },
+  "flush_interval_ms": 500,
+  "worker_count": 4
+}

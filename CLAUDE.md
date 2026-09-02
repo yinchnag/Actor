@@ -50,9 +50,10 @@ ACTOR_STRESS=1 go test -run TestActorLoaderCrossGoroutineHighConcurrencyStabilit
 
 ### VS Code Integration
 All debug configurations and tasks are pre-configured in .vscode/launch.json and .vscode/tasks.json. Use Ctrl+Shift+D to open the Run and Debug panel or Ctrl+Shift+P to access tasks. Key configurations:
-- **Debug deadlock_demo**: stale — cmd/deadlock_demo no longer exists. The runnable program
-  under cmd/ is now `noteserver` (see cmd/noteserver/README.md); .vscode/launch.json still
-  points at the removed demo and needs updating if you use those configs.
+- **Debug noteserver / Test - noteserver**: run the example service under cmd/noteserver.
+  Both set `cwd` to that directory because noteserver reads ./data for its two config files.
+  Note it is a **separate Go module** — the parent module's `go build ./...` and
+  `go test ./...` do not reach into it, so run its tests from that directory.
 - **Test - Race detector**: Run tests with -race flag to catch data races
 
 ## Architecture & Core Concepts
@@ -339,4 +340,14 @@ follow from the event loop being a single consumer (blocking calls, call cycles,
 discarded-error handling, state not leaking out of a module).
 开发文档_基础版.md holds the original design requirements and explains the rationale for the
 CRTP pattern, protocol routing, and cross-goroutine task semantics.
-cmd/noteserver/ is a worked example (HTTP service on real MySQL + Redis) with its own README.
+cmd/noteserver/ is a worked example with its own go.mod and README: an HTTP service
+(Gin + Norm ORM on real MySQL + Redis) laid out like the roleSvr reference project.
+It is a nested module — `replace actor => ../..` points back at this framework, so the
+parent module stays free of gin/ORM dependencies and `./...` here never builds it.
+
+web/ is a **separate module, sibling to actor rather than part of it**: a gin-based
+auto-router where a struct embeds `Router[*itself]` and its public methods become HTTP
+routes. It imports nothing from actor — the two only share the CRTP technique. Keeping
+it out of this module is deliberate: gin drags in 26 transitive dependencies, and a
+project that only wants the actor concurrency model should not pay for them. Check
+`grep gin go.mod` here — it must stay empty. See web/README.md.

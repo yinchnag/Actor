@@ -2,23 +2,26 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Debug deadlock_demo",
+            "name": "Debug noteserver",
             "type": "go",
             "request": "launch",
             "mode": "debug",
-            "program": "${workspaceFolder}/cmd/deadlock_demo",
-            "cwd": "${workspaceFolder}",
-            "showLog": true,
-            "trace": "verbose"
+            "program": "${workspaceFolder}/cmd/noteserver",
+            "cwd": "${workspaceFolder}/cmd/noteserver",
+            "env": {
+                "GIN_MODE": "debug"
+            },
+            "showLog": true
         },
         {
-            "name": "Run deadlock_demo (no debug)",
+            "name": "Test - noteserver",
             "type": "go",
             "request": "launch",
-            "mode": "exec",
-            "program": "${workspaceFolder}/bin/deadlock_demo.exe",
-            "cwd": "${workspaceFolder}",
-            "preLaunchTask": "Build deadlock_demo"
+            "mode": "test",
+            "program": "${workspaceFolder}/cmd/noteserver",
+            "cwd": "${workspaceFolder}/cmd/noteserver",
+            "args": ["-v", "-count=1"],
+            "showLog": true
         },
         {
             "name": "Test - Actor core tests",
