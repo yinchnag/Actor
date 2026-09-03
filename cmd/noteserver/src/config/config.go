@@ -20,6 +20,12 @@ type Server struct {
 	Addr    string `json:"addr"`     // 监听地址，如 0.0.0.0
 	Port    string `json:"port"`     // 监听端口，如 8080
 	GinMode string `json:"gin_mode"` // debug / release / test，留空按 gin 默认
+
+	// OpsToken 运维接口的令牌（邮件下发）。
+	//
+	// 它不在必填项里：留空时运维接口整组返回 503 而不是敞开，
+	// 所以"忘了配"的后果是那组接口不可用，而不是任何人都能发道具。
+	OpsToken string `json:"ops_token"`
 }
 
 // Listen 返回 net.Listen 用的 host:port。
@@ -51,6 +57,8 @@ func LoadServer(path string) (*Server, error) {
 	overrideFromEnv("SERVER_ADDR", &cfg.Addr)
 	overrideFromEnv("SERVER_PORT", &cfg.Port)
 	overrideFromEnv("GIN_MODE", &cfg.GinMode)
+	// 令牌尤其该走环境变量：写进入库的 json 等于把它公开了
+	overrideFromEnv("OPS_TOKEN", &cfg.OpsToken)
 
 	// 逐项报缺，别让人对着一句 "invalid config" 猜是哪个键没填
 	missing := make([]string, 0, 2)

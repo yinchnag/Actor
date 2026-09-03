@@ -29,6 +29,19 @@ type INoteStore interface {
 	List(uid string, limit int) ([]comm.NoteSnap, error)
 }
 
+// IMailStore 邮件存储。
+//
+// 接口是**按信箱**而不是按单封邮件设计的：整个信箱是一条记录，
+// "新增一封、超了顶掉最老的"因此是一次读改写而不是若干条增删。
+// 见 databases/mail.go 里为什么这么存。
+type IMailStore interface {
+	// Load 取某个用户的信箱，按下发时间倒序。信箱不存在时返回空切片而不是错误——
+	// 从没收过邮件是正常状态，不该让调用方去分辨 ErrNotFound。
+	Load(uid string) ([]comm.MailSnap, error)
+	// Save 整体写回信箱。调用方负责已经排好序、也已经裁到上限之内。
+	Save(uid string, mails []comm.MailSnap) error
+}
+
 // ISessionStore 登录会话存储。
 //
 // 会话只进 Redis 不落 MySQL：它是纯临时态，重启后从 Redis 恢复即可，

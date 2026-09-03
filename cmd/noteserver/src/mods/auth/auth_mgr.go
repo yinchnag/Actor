@@ -10,11 +10,11 @@ package auth
 
 import (
 	"errors"
-	"log"
 	"time"
 
 	"noteserver/src/comm"
 	"noteserver/src/contract"
+	"noteserver/src/logs"
 
 	"actor"
 )
@@ -93,6 +93,6 @@ func (that *AuthMgr) TouchLogin(uid string, at time.Time) {
 	case errors.Is(err, contract.ErrAccountNotFound):
 		// 账号刚验过密码，这里查不到只可能是并发注销，不值得记一条错误日志
 	default:
-		log.Printf("[AuthMgr] 记录 %s 的登录时间失败: %v", uid, err)
+		logs.Warnf("[AuthMgr] 记录 %s 的登录时间失败: %v", uid, err)
 	}
 }

@@ -7,14 +7,16 @@ package service
 import (
 	"fmt"
 	"hash/fnv"
-	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"noteserver/src/comm"
 	"noteserver/src/contract"
+	"noteserver/src/logs"
 	"noteserver/src/mods/auth"
+	"noteserver/src/mods/mail"
 	"noteserver/src/mods/note"
 
 	"actor"
@@ -26,6 +28,7 @@ import (
 type Deps struct {
 	Accounts contract.IAccountStore
 	Notes    contract.INoteStore
+	Mails    contract.IMailStore
 	Sessions contract.ISessionStore
 }
 
@@ -44,8 +47,15 @@ type userActor struct {
 type Hub struct {
 	deps Deps
 
-	auth   [comm.AuthShards]*actor.ActorLoader
-	authWG sync.WaitGroup
+	// shards 是所有 **_mgr.go 模块的分片组，按模块类型名索引。
+	//
+	// 早先这里是一个写死的 auth 数组、外加一个写死的 AuthFor 方法，生成门面的
+	// 模板里也直接写着 that.AuthFor(uid)。加第二个分片 Mgr（邮件）时才发现：
+	// 那份模板对第二个模块完全不可用，只能整份复制一遍改一个方法名。
+	// 改成按模块名索引之后，模板里那行变成 that.ShardFor("XxxMgr", uid)，
+	// 对任意分片 Mgr 都成立，加模块不再需要碰模板。
+	shards   map[string][]*actor.ActorLoader
+	shardsWG sync.WaitGroup
 
 	mu    sync.Mutex
 	users map[string]*userActor
@@ -63,30 +73,63 @@ type Hub struct {
 
 // NewHub 建 Hub 并把 auth 分片全部拉起来。
 func NewHub(deps Deps) *Hub {
+	// 依赖漏配会让模块拿到一个 nil 存储，然后在第一次调那个接口时以空指针的
+	// 形式炸在请求协程上——离真正的原因隔着十万八千里。启动时就说清楚。
+	switch {
+	case deps.Accounts == nil:
+		panic("service: Deps.Accounts 没有配置")
+	case deps.Notes == nil:
+		panic("service: Deps.Notes 没有配置")
+	case deps.Mails == nil:
+		panic("service: Deps.Mails 没有配置")
+	case deps.Sessions == nil:
+		panic("service: Deps.Sessions 没有配置")
+	}
+
 	h := &Hub{
 		deps:        deps,
 		users:       make(map[string]*userActor),
+		shards:      make(map[string][]*actor.ActorLoader),
 		stopJanitor: make(chan struct{}),
 		janitorDone: make(chan struct{}),
 	}
 
 	// 规范第 7 条：**_mgr.go 的模块在启动时加载。
-	// AuthMgr 是 Mgr 不是 Mod，因为登入验证在用户登进来之前就得能跑。
-	for i := range h.auth {
-		l := actor.NewActorLoader(fmt.Sprintf("auth-%d", i))
-		l.Init()
-		l.AddModule(auth.NewAuthMgr(deps.Accounts))
-		// 接管丢弃上报：无返回值调用的失败没有调用方能接，
-		// 不接管的话框架只会往 stderr 打限流日志。这里全部计数并落日志。
-		l.SetDiscardedErrorHandler(h.onDiscarded)
-		// Start 返回时 goroutineID 已发布，此后外部调用必然走入队路径，
-		// 不会退化成在调用方栈上直接改模块状态。
-		l.Start(&h.authWG)
-		h.auth[i] = l
-	}
+	// 加新的 Mgr 就在这里加一行——名字必须与模块类型名一致，
+	// 生成的门面按那个名字来 ShardFor。
+	h.startShards("AuthMgr", comm.AuthShards, func() actor.IModule {
+		return auth.NewAuthMgr(deps.Accounts)
+	})
+	// MailMgr 需要把信箱推给在线用户，而那条边的门面挂在 Hub 上——
+	// 把 h 自己传进去即可（mods 不能 import service，所以模块那边声明的是
+	// 一个只含所需方法的小接口，见 mods/mail 里的 mailPusher）。
+	h.startShards("MailMgr", comm.MailShards, func() actor.IModule {
+		return mail.NewMailMgr(deps.Mails, h)
+	})
 
 	go h.janitor()
 	return h
+}
+
+// startShards 拉起一组分片 actor，每片挂一个模块实例。
+//
+// 每片一个**独立的模块实例**，不是同一个实例挂多处：模块里的状态归它自己的
+// 事件循环独占，共享实例等于把状态暴露给多条协程，actor 的保证立刻失效。
+func (that *Hub) startShards(name string, n int, newMod func() actor.IModule) {
+	loaders := make([]*actor.ActorLoader, n)
+	for i := range loaders {
+		l := actor.NewActorLoader(fmt.Sprintf("%s-%d", strings.ToLower(name), i))
+		l.Init()
+		l.AddModule(newMod())
+		// 接管丢弃上报：无返回值调用的失败没有调用方能接，
+		// 不接管的话框架只会往 stderr 打限流日志。这里全部计数并落日志。
+		l.SetDiscardedErrorHandler(that.onDiscarded)
+		// Start 返回时 goroutineID 已发布，此后外部调用必然走入队路径，
+		// 不会退化成在调用方栈上直接改模块状态。
+		l.Start(&that.shardsWG)
+		loaders[i] = l
+	}
+	that.shards[name] = loaders
 }
 
 // Sessions 暴露会话存储，供鉴权中间件使用。
@@ -95,11 +138,19 @@ func NewHub(deps Deps) *Hub {
 // 所以它不经过任何 loader。
 func (that *Hub) Sessions() contract.ISessionStore { return that.deps.Sessions }
 
-// AuthFor 按 UID 选分片。同一个号码永远得到同一个 actor。
-func (that *Hub) AuthFor(uid string) *actor.ActorLoader {
+// ShardFor 按业务键选某个 Mgr 的分片。同一个键永远得到同一个 actor。
+//
+// 生成的门面调的就是它（见 templates/shard_export.tmpl）。模块名写错会 panic
+// 而不是静默返回 nil：那种错只会在第一次调用该接口时以空指针的形式炸在
+// 请求协程上，不如启动后第一次调用就说清楚。
+func (that *Hub) ShardFor(mod, key string) *actor.ActorLoader {
+	loaders, ok := that.shards[mod]
+	if !ok || len(loaders) == 0 {
+		panic("service: 模块 " + mod + " 没有注册分片——请在 NewHub 里加一行 startShards")
+	}
 	sum := fnv.New32a()
-	_, _ = sum.Write([]byte(uid))
-	return that.auth[sum.Sum32()%comm.AuthShards]
+	_, _ = sum.Write([]byte(key))
+	return loaders[sum.Sum32()%uint32(len(loaders))]
 }
 
 // LoadUser 给某个用户挂上他的 **_mod.go 模块。
@@ -113,6 +164,33 @@ func (that *Hub) AuthFor(uid string) *actor.ActorLoader {
 func (that *Hub) LoadUser(uid string) {
 	that.AcquireUser(uid)
 	that.ReleaseUser(uid)
+	// 上线握手：让 MailMgr 把这个用户的信箱推到他刚建好的 MailboxMod 上。
+	//
+	// 由 Hub 发起而不是让 mod 自己去要——那样 mod 就得长出一条对外调用，
+	// 而"它永远不调别人、因此永远不会停下来等谁"这个性质比小心写同步可靠得多。
+	// 无返回值，登录应答不等它：数据到了客户端下一次拉取就能看到。
+	that.MailFetch(actor.CurrentGID(), uid)
+}
+
+// TryUser 取某个用户**已经存在**的 actor，不存在就返回 nil。
+//
+// 与 AcquireUser 的唯一区别是不创建。这条区别很要紧：推送的语义是"他在就给他，
+// 不在就算了"——离线用户的数据本来就在存储里，等他下次登录会重新拉。用
+// AcquireUser 去推，会给一个刚被回收的用户重新拉起一条协程，把"在线用户数"
+// 悄悄变成"登录过的用户数"。
+//
+// 拿到非 nil 时 inFlight 已经加过了，用完必须 ReleaseUser——语义与 AcquireUser
+// 一致，生成的通知门面里就是这么配对的（见 templates/user_notify.tmpl）。
+func (that *Hub) TryUser(uid string) *actor.ActorLoader {
+	that.mu.Lock()
+	defer that.mu.Unlock()
+	ua := that.users[uid]
+	if ua == nil {
+		return nil
+	}
+	ua.inFlight.Add(1)
+	ua.lastUsed.Store(time.Now().UnixNano())
+	return ua.loader
 }
 
 // AcquireUser 取（必要时创建）某个用户的 actor，并把它标记为使用中。
@@ -128,6 +206,9 @@ func (that *Hub) AcquireUser(uid string) *actor.ActorLoader {
 		l := actor.NewActorLoader("user-" + uid)
 		l.Init()
 		l.AddModule(note.NewNoteMod(that.deps.Notes, uid))
+		// 用户侧的信箱**只读**视图。它不碰存储、也不调任何人——
+		// 数据全靠 MailMgr 推过来，写操作由 rut 直连 mgr。
+		l.AddModule(mail.NewMailboxMod(uid))
 		l.SetDiscardedErrorHandler(that.onDiscarded)
 		l.Start(&ua.wg)
 		ua.loader = l
@@ -217,10 +298,12 @@ func (that *Hub) Close() {
 			ua.loader.Close()
 			ua.wg.Wait()
 		}
-		for _, l := range that.auth {
-			l.Close()
+		for _, loaders := range that.shards {
+			for _, l := range loaders {
+				l.Close()
+			}
 		}
-		that.authWG.Wait()
+		that.shardsWG.Wait()
 	})
 }
 
@@ -236,5 +319,5 @@ func (that *Hub) DiscardedErrors() uint64 { return that.discarded.Load() }
 // actor 自己的事件循环上。所以必须廉价，而且绝不能回头再调这个 actor。
 func (that *Hub) onDiscarded(e actor.DiscardedError) {
 	that.discarded.Add(1)
-	log.Printf("[discarded] %v", e)
+	logs.Errorf("[discarded] %v", e)
 }

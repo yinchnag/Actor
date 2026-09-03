@@ -12,7 +12,7 @@ import (
 //
 // passwordHash 由调用方（HTTP 层）预先算好，见包注释。
 func (that *Hub) AuthRegister(gid uint64, uid string, passwordHash string) (string, error) {
-	out, err := that.AuthFor(uid).ModInvokeFrom(gid, "AuthMgr", "Register", uid, passwordHash)
+	out, err := that.ShardFor("AuthMgr", uid).ModInvokeFrom(gid, "AuthMgr", "Register", uid, passwordHash)
 	return unwrap[string](out, err, "AuthMgr.Register")
 }
 
@@ -22,7 +22,7 @@ func (that *Hub) AuthRegister(gid uint64, uid string, passwordHash string) (stri
 // **Snap。哈希跟着快照一起离开 actor，只是在同一个进程内传递，HTTP 层比对完
 // 就丢；换来的是 bcrypt 那几十毫秒不占用事件循环。
 func (that *Hub) AuthLookup(gid uint64, uid string) (comm.AccountSnap, error) {
-	out, err := that.AuthFor(uid).ModInvokeFrom(gid, "AuthMgr", "Lookup", uid)
+	out, err := that.ShardFor("AuthMgr", uid).ModInvokeFrom(gid, "AuthMgr", "Lookup", uid)
 	return unwrap[comm.AccountSnap](out, err, "AuthMgr.Lookup")
 }
 
@@ -40,5 +40,5 @@ func (that *Hub) AuthTouchLogin(gid uint64, uid string, at time.Time) {
 	// 无返回值 = 投递即忘，调用方不等它完成。这里的 error 只可能是投递失败
 	// （队列满、actor 已关），而那一类框架已经报给 DiscardedErrorHandler 了，
 	// 再返回一次只会让调用方重复处理同一件事。
-	_, _ = that.AuthFor(uid).ModInvokeFrom(gid, "AuthMgr", "TouchLogin", uid, at)
+	_, _ = that.ShardFor("AuthMgr", uid).ModInvokeFrom(gid, "AuthMgr", "TouchLogin", uid, at)
 }

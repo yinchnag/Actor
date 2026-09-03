@@ -10,8 +10,8 @@ package bases
 import (
 	"context"
 	"errors"
-	"log"
 	"net/http"
+	"noteserver/src/logs"
 	"os"
 	"os/signal"
 	"syscall"
@@ -57,7 +57,7 @@ func Run(addr string, handler http.Handler, onShutdown func()) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("监听 %s", srv.Addr)
+		logs.Infof("监听 %s", srv.Addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
@@ -70,13 +70,13 @@ func Run(addr string, handler http.Handler, onShutdown func()) error {
 	case err := <-errCh:
 		return err
 	case s := <-sig:
-		log.Printf("收到信号 %v，开始退出", s)
+		logs.Infof("收到信号 %v，开始退出", s)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Printf("HTTP 优雅退出超时: %v", err)
+		logs.Warnf("HTTP 优雅退出超时: %v", err)
 	}
 	if onShutdown != nil {
 		onShutdown()

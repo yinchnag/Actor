@@ -17,6 +17,7 @@ import (
 	"noteserver/src/middleware"
 	"noteserver/src/router/auth"
 	"noteserver/src/router/health"
+	"noteserver/src/router/mail"
 	"noteserver/src/router/note"
 	"noteserver/src/service"
 
@@ -41,7 +42,11 @@ type harness struct {
 	hub   *service.Hub
 	accs  *memAccounts
 	notes *memNotes
+	mails *memMails
 }
+
+// opsToken 是测试里运维接口用的令牌。
+const opsToken = "test-ops-token"
 
 // newHarness 装出一套与 main 完全相同的路由，只是把三个存储换成内存实现。
 //
@@ -51,10 +56,11 @@ type harness struct {
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 
-	accs, notes := newMemAccounts(), newMemNotes()
+	accs, notes, mails := newMemAccounts(), newMemNotes(), newMemMails()
 	hub := service.NewHub(service.Deps{
 		Accounts: accs,
 		Notes:    notes,
+		Mails:    mails,
 		Sessions: newMemSessions(),
 	})
 
@@ -64,10 +70,13 @@ func newHarness(t *testing.T) *harness {
 	health.New(engine, hub)
 	auth.New(v1, hub)
 	// 与 main 一样：路径来自请求类型上的 path tag，分组只负责套鉴权
-	note.New(v1.Group("", middleware.Auth(hub.Sessions())), hub)
+	userGroup := v1.Group("", middleware.Auth(hub.Sessions()))
+	note.New(userGroup, hub)
+	mail.NewUser(userGroup, hub)
+	mail.NewOps(v1.Group("", middleware.OpsAuth(opsToken)), hub)
 
 	ts := httptest.NewServer(engine)
-	h := &harness{t: t, ts: ts, hub: hub, accs: accs, notes: notes}
+	h := &harness{t: t, ts: ts, hub: hub, accs: accs, notes: notes, mails: mails}
 	t.Cleanup(func() {
 		ts.Close() // 先停 HTTP，让在途请求释放手上的 actor
 		hub.Close()

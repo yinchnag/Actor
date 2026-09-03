@@ -1,5 +1,6 @@
 {
   "addr": "0.0.0.0",
   "port": "8080",
-  "gin_mode": "debug"
+  "gin_mode": "debug",
+  "ops_token": "dev-ops-token-change-me"
 }

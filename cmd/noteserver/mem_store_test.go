@@ -188,3 +188,68 @@ func itoa64(n int64) string {
 	}
 	return string(buf[i:])
 }
+
+type memMails struct {
+	mu     sync.Mutex
+	data   map[string][]comm.MailSnap
+	onCall func(op string) error
+	// loads 记录 Load 被调了几次。用来验证"用户侧的读不回 MailMgr"——
+	// 那是给用户加一个 MailboxMod 的全部理由，没有这个计数就只能靠肉眼相信。
+	loads int
+}
+
+func newMemMails() *memMails { return &memMails{data: make(map[string][]comm.MailSnap)} }
+
+func (that *memMails) fail(op string) error {
+	if that.onCall == nil {
+		return nil
+	}
+	return that.onCall(op)
+}
+
+func (that *memMails) Load(uid string) ([]comm.MailSnap, error) {
+	that.mu.Lock()
+	defer that.mu.Unlock()
+	that.loads++
+	if err := that.fail("Load"); err != nil {
+		return nil, err
+	}
+	// 拷一份再给：真实存储每次都返回新对象，内存版直接把 map 里的切片交出去
+	// 会让调用方改到"存储里的数据"，测试就验不出"忘了写回"这类 bug。
+	out := make([]comm.MailSnap, len(that.data[uid]))
+	copy(out, that.data[uid])
+	return out, nil
+}
+
+func (that *memMails) Save(uid string, mails []comm.MailSnap) error {
+	that.mu.Lock()
+	defer that.mu.Unlock()
+	if err := that.fail("Save"); err != nil {
+		return err
+	}
+	cp := make([]comm.MailSnap, len(mails))
+	copy(cp, mails)
+	that.data[uid] = cp
+	return nil
+}
+
+func (that *memMails) count(uid string) int {
+	that.mu.Lock()
+	defer that.mu.Unlock()
+	return len(that.data[uid])
+}
+
+func (that *memMails) loadCount() int {
+	that.mu.Lock()
+	defer that.mu.Unlock()
+	return that.loads
+}
+
+// snapshot 取某个用户存储里的邮件副本，供测试构造场景用。
+func (that *memMails) snapshot(uid string) []comm.MailSnap {
+	that.mu.Lock()
+	defer that.mu.Unlock()
+	out := make([]comm.MailSnap, len(that.data[uid]))
+	copy(out, that.data[uid])
+	return out
+}

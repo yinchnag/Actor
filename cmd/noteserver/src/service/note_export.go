@@ -9,16 +9,20 @@ import (
 
 // Add 存一条笔记，返回落库后的完整快照。上传时间由服务端生成，不采信客户端传来的时间。
 func (that *Hub) NoteAdd(gid uint64, uid string, content string) (comm.NoteSnap, error) {
+	// 有返回值 = 请求，来自 rut。actor 不在就建一个。
 	loader := that.AcquireUser(uid)
 	defer that.ReleaseUser(uid)
+
 	out, err := loader.ModInvokeFrom(gid, "NoteMod", "Add", content)
 	return unwrap[comm.NoteSnap](out, err, "NoteMod.Add")
 }
 
 // List 取笔记，按上传时间倒序。首次访问从存储预热缓存，之后直接命中。
 func (that *Hub) NoteList(gid uint64, uid string) ([]comm.NoteSnap, error) {
+	// 有返回值 = 请求，来自 rut。actor 不在就建一个。
 	loader := that.AcquireUser(uid)
 	defer that.ReleaseUser(uid)
+
 	out, err := loader.ModInvokeFrom(gid, "NoteMod", "List")
 	return unwrap[[]comm.NoteSnap](out, err, "NoteMod.List")
 }

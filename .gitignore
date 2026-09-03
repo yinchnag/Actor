@@ -35,6 +35,14 @@ coverage.txt
 /noteserver
 /GameSvr
 
+# GCore 的日志库把日志写到 <basePath>/logs/，跑服务或跑测试都会产生，
+# 按天切割久了会堆很多份。
+#
+# 必须写成锚定路径。写成裸的 logs/ 会匹配任意层级的同名目录——包括
+# cmd/noteserver/src/logs/ 那个**日志出口源码包**，那样提交出去的版本编译不过。
+/logs/
+/cmd/noteserver/logs/
+
 # 约定的产物目录，如果以后改成统一往这里输出
 /bin/
 

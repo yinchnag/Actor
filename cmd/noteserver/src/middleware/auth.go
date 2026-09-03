@@ -3,12 +3,12 @@ package middleware
 
 import (
 	"errors"
-	"log"
 	"net/http"
 	"strings"
 
 	"noteserver/src/bases"
 	"noteserver/src/contract"
+	"noteserver/src/logs"
 
 	"github.com/gin-gonic/gin"
 )
@@ -35,7 +35,7 @@ func Auth(sessions contract.ISessionStore) gin.HandlerFunc {
 			return
 		}
 		if err != nil {
-			log.Printf("读会话失败: %v", err)
+			logs.Warnf("读会话失败: %v", err)
 			bases.Fail(ctx, http.StatusServiceUnavailable, "会话服务暂时不可用")
 			return
 		}

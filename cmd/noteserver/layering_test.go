@@ -25,32 +25,39 @@ func TestLayering(t *testing.T) {
 	// 空列表表示"谁都不能引"，也就是依赖图的底层。
 	allowed := map[string][]string{
 		// 整个项目的数据源。它是底层，谁都能用它、它不用任何人。
+		// 注意它连 logs 都不能引——comm 里只有数据，没有会失败的逻辑，
+		// 也就没有该记的日志。
 		"comm": {},
+		// 日志出口。它包着 GCore，本身不依赖任何内部包，所以谁都能引。
+		"logs": {},
 		// 只放接口与它们返回的错误哨兵。
 		"contract": {"comm"},
 		// 存储对象。再往上的东西（mods/service）它不该认识。
-		"databases": {"comm", "contract"},
+		"databases": {"comm", "contract", "logs"},
 
 		// 以下三个不在规范的七个文件夹里，属于第 8 条允许的补充，
 		// 但同样受依赖约束管——它们都在 HTTP 侧，不许碰 mods/service。
-		"bases":      {"comm"},
-		"security":   {"comm"},
+		"bases":      {"comm", "logs"},
+		"security":   {"comm", "logs"},
 		"config":     {},
-		"middleware": {"bases", "comm", "contract"},
+		"middleware": {"bases", "comm", "contract", "logs"},
 
 		// 逻辑模块。**绝不能引 service**：那会跟 service→mods 成环，
 		// 也会让模块之间越过导出函数直接互调（见 README 第 7 条）。
-		"mods/auth": {"comm", "contract"},
-		"mods/note": {"comm", "contract"},
+		"mods/auth": {"comm", "contract", "logs"},
+		"mods/mail": {"comm", "contract", "logs"},
+		"mods/note": {"comm", "contract", "logs"},
 
 		// 路由。它通过自己声明的小接口拿 Hub 的能力，所以也不引 service。
-		"router/auth":   {"bases", "comm", "contract", "security", "middleware"},
-		"router/note":   {"bases", "comm", "contract", "security", "middleware"},
-		"router/health": {"bases", "comm", "contract", "security", "middleware"},
+		"router/auth":   {"bases", "comm", "contract", "security", "middleware", "logs"},
+		"router/note":   {"bases", "comm", "contract", "security", "middleware", "logs"},
+		"router/health": {"bases", "comm", "contract", "security", "middleware", "logs"},
+		"router/mail":   {"bases", "comm", "contract", "security", "middleware", "logs"},
 
 		// 最上层的终端，可以引所有包。
-		"service": {"comm", "contract", "databases", "mods/auth", "mods/note",
-			"bases", "security", "config", "middleware"},
+		"service": {"comm", "contract", "databases",
+			"mods/auth", "mods/mail", "mods/note",
+			"bases", "security", "config", "middleware", "logs"},
 	}
 
 	const prefix = "noteserver/src/"
@@ -97,10 +104,13 @@ func TestLayering(t *testing.T) {
 	}
 }
 
-// TestModFileNaming 一个功能模块文件夹只能有一个 **_mod.go 或 **_mgr.go。
+// TestModFileNaming 一个功能模块文件夹里，**_mod.go 与 **_mgr.go 各最多一个。
 //
-// 规范第 5 条。两个入口意味着两个 ModObj，也就是两条跨 goroutine 的通道进同一个
-// 功能——真要细分该用 **_imp.go 由 Mod/Mgr 持有，而不是再开一个模块。
+// 规范第 5 条。同一种有两个意味着同一类宿主上挂了两个 ModObj，也就是两条跨
+// goroutine 的通道进同一个功能——真要细分该用 **_imp.go 由 Mod/Mgr 持有。
+//
+// 但两种并存是合法的：邮件功能就是 mgr（管存储与下发，用户不在线也要能跑）
+// 加 mod（管用户在线期间的信箱视图，读不出他自己那条协程）。
 func TestModFileNaming(t *testing.T) {
 	dirs, err := filepath.Glob(filepath.Join("src", "mods", "*"))
 	if err != nil {
@@ -108,19 +118,29 @@ func TestModFileNaming(t *testing.T) {
 	}
 	for _, dir := range dirs {
 		files, _ := filepath.Glob(filepath.Join(dir, "*.go"))
-		entries := make([]string, 0, 2)
+		var mods, mgrs []string
 		for _, f := range files {
-			base := filepath.Base(f)
-			if strings.HasSuffix(base, "_mod.go") || strings.HasSuffix(base, "_mgr.go") {
-				entries = append(entries, base)
+			switch base := filepath.Base(f); {
+			case strings.HasSuffix(base, "_mod.go"):
+				mods = append(mods, base)
+			case strings.HasSuffix(base, "_mgr.go"):
+				mgrs = append(mgrs, base)
 			}
 		}
-		switch len(entries) {
-		case 1: // 正好一个，合规
-		case 0:
-			t.Errorf("%s 里没有 **_mod.go 或 **_mgr.go——功能模块文件夹必须有且只有一个入口", dir)
-		default:
-			t.Errorf("%s 里有多个模块入口 %v——细分功能请用 **_imp.go 由 Mod/Mgr 持有", dir, entries)
+		// 每种入口最多一个，两种加起来至少一个。
+		//
+		// 一个功能同时有 mgr 和 mod 是合法的（邮件就是：mgr 管存储与下发，
+		// mod 管用户在线期间的视图）。但同一种不能有两个——那意味着同一类
+		// 宿主上挂了两个 ModObj，也就是两条跨 goroutine 的通道进同一个功能。
+		// 真要细分该用 **_imp.go 由 Mod/Mgr 持有。
+		if len(mods) > 1 {
+			t.Errorf("%s 里有多个 **_mod.go %v——细分功能请用 **_imp.go 由 Mod 持有", dir, mods)
+		}
+		if len(mgrs) > 1 {
+			t.Errorf("%s 里有多个 **_mgr.go %v——细分功能请用 **_imp.go 由 Mgr 持有", dir, mgrs)
+		}
+		if len(mods)+len(mgrs) == 0 {
+			t.Errorf("%s 里没有 **_mod.go 或 **_mgr.go——功能模块文件夹必须有入口", dir)
 		}
 	}
 }
@@ -194,6 +214,57 @@ func TestCommStructsAreSnap(t *testing.T) {
 			if !strings.HasSuffix(ts.Name.Name, "Snap") {
 				t.Errorf("%s: comm 里导出的 struct %s 必须以 Snap 结尾——"+
 					"不带 Snap 的类型不该跨模块传递", f, ts.Name.Name)
+			}
+			return true
+		})
+	}
+}
+
+// TestModsInterfacesAreNotifyOnly mods 包里声明的接口，方法一律不许有返回值。
+//
+// 这条钉的是整套设计里最容易悄悄腐化的一点。模块要调别的模块时，在自己包里声明
+// 一个只含所需方法的小接口、由 Hub 注入（规范第 7 条）——那些接口就是**模块之间
+// 所有调用的出口**，把它们卡住，等于把"模块之间只能单向通知"变成编译期约束。
+//
+// 为什么不能有返回值：框架的事件循环是单消费者，一个模块方法只要在等另一个
+// actor 的返回值，它自己的队列就停着不动。两个模块互相等就是死锁，而框架的环
+// 检测只覆盖同步调用——写成同步之后，能救你的只有 3 秒超时。
+//
+// 注意这**不限制**模块自己的公有方法：MailboxMod.List 有返回值是对的，
+// 它的调用方是 rut，跑在 gin 的请求协程上，不会被任何模块调用。
+// 界线在"谁调它"，而 mods 里声明的接口按定义就是给模块自己调的。
+func TestModsInterfacesAreNotifyOnly(t *testing.T) {
+	fset := token.NewFileSet()
+	files, _ := filepath.Glob(filepath.Join("src", "mods", "*", "*.go"))
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		parsed, err := parser.ParseFile(fset, f, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Errorf("解析 %s 失败: %v", f, err)
+			continue
+		}
+		ast.Inspect(parsed, func(n ast.Node) bool {
+			ts, ok := n.(*ast.TypeSpec)
+			if !ok {
+				return true
+			}
+			it, ok := ts.Type.(*ast.InterfaceType)
+			if !ok {
+				return true
+			}
+			for _, m := range it.Methods.List {
+				fn, ok := m.Type.(*ast.FuncType)
+				if !ok || len(m.Names) == 0 {
+					continue // 内嵌接口之类
+				}
+				if fn.Results != nil && len(fn.Results.List) > 0 {
+					t.Errorf("%s: 接口 %s 的方法 %s 有返回值——"+
+						"模块之间只能单向通知，带返回值会让调用方的事件循环停下来等，"+
+						"两个模块互相等就是死锁",
+						f, ts.Name.Name, m.Names[0].Name)
+				}
 			}
 			return true
 		})

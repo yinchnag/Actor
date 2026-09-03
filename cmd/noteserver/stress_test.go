@@ -89,6 +89,7 @@ func realStorage() (service.Deps, error) {
 		realDeps = service.Deps{
 			Accounts: databases.NewAccountStore(),
 			Notes:    databases.NewNoteStore(),
+			Mails:    databases.NewMailStore(),
 			Sessions: databases.NewSessionStore(),
 		}
 		realReady.Store(true)
@@ -161,6 +162,7 @@ func newStressHarness(t *testing.T) *stressHarness {
 		deps = service.Deps{
 			Accounts: newMemAccounts(),
 			Notes:    mem,
+			Mails:    newMemMails(),
 			Sessions: newMemSessions(),
 		}
 	}
